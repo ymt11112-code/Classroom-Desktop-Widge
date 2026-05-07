@@ -2,7 +2,7 @@ services:
   - type: web
     name: line-webhook-proxy
     runtime: node
-    rootDir: 班級經營桌面工具/line-webhook-proxy
+    rootDir: line-webhook-proxy
     buildCommand: npm install
     startCommand: npm start
     plan: free
