@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: line-webhook-proxy
+    runtime: node
+    rootDir: 班級經營桌面工具/line-webhook-proxy
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_DEFAULT_USER_ID
+        sync: false
+      - key: GAS_BASE_URL
+        sync: false
