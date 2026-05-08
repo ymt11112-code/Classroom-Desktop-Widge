@@ -267,16 +267,11 @@ async function fetchStudentList() {
 
 async function saveAbsenceRecordToGas(record) {
   const gasUrl = new URL(GAS_BASE_URL);
-  const body = new URLSearchParams();
-  body.set('action', 'saveAbsenceRecord');
-  body.set('data', JSON.stringify(record));
+  gasUrl.searchParams.set('action', 'saveAbsenceRecord');
+  gasUrl.searchParams.set('data', JSON.stringify(record));
 
   const response = await requestJson(gasUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'
-    },
-    body: body.toString()
+    method: 'GET'
   });
 
   if (!response.ok) {
