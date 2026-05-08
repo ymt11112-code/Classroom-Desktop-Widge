@@ -301,12 +301,13 @@ function buildParsedAbsenceRecords(text, students) {
     endDate = addWeekdays(startDate, durationDays - 1);
   }
 
-  const periods = inferPeriodsFromText(normalizedText) || (mode === 'leave' ? '7' : '');
+  const inferredPeriods = inferPeriodsFromText(normalizedText);
   const leaveType = mode === 'leave' ? inferLeaveTypeFromText(normalizedText) : (mode === 'late' ? '遲到' : '早退');
   const meal = mode === 'leave' ? (inferMealChoiceFromText(normalizedText) || '否') : '';
   const days = mode === 'leave'
-    ? calculateDays(startDate, endDate, periods)
+    ? calculateDays(startDate, endDate, inferredPeriods || '7')
     : String(countWeekdaysInclusive(startDate, endDate) || (startDate ? 1 : 0));
+  const periods = resolvePeriodsValue(mode, startDate, endDate, inferredPeriods, days);
   const mealRule = evaluateMealRule({
     leaveType,
     meal,
@@ -329,6 +330,19 @@ function buildParsedAbsenceRecords(text, students) {
     mealRuleMessage: mealRule.message,
     note
   }));
+}
+
+function resolvePeriodsValue(mode, startDate, endDate, inferredPeriods, days) {
+  if (mode !== 'leave') return '';
+  if (inferredPeriods) return inferredPeriods;
+
+  const schoolDays = countWeekdaysInclusive(startDate, endDate);
+  if (schoolDays > 1) {
+    return String(schoolDays * 7);
+  }
+
+  if (String(days || '') === '0.5') return '4';
+  return '7';
 }
 
 function evaluateMealRule(input) {
@@ -553,6 +567,8 @@ function stripDatePhrases(text) {
   return String(text || '')
     .replace(/今天|今日|明天|後天/g, ' ')
     .replace(/(下週|下周|這週|這周|本週|本周|週|星期|禮拜)[一二三四五六日天]/g, ' ')
+    .replace(/\d{1,2}[\/.-]\d{1,2}\s*[-~～]\s*\d{1,2}[\/.-]\d{1,2}/g, ' ')
+    .replace(/\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}\s*[-~～]\s*\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}/g, ' ')
     .replace(/\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}/g, ' ')
     .replace(/\d{1,2}[\/.-]\d{1,2}/g, ' ');
 }
@@ -629,7 +645,7 @@ function inferStudentsFromText(text, students) {
   const matches = [];
   const textWithoutDates = stripDatePhrases(text);
 
-  for (const match of textWithoutDates.matchAll(/(^|[^\d])(\d{1,2})\s*號?(?!\d)/g)) {
+  for (const match of textWithoutDates.matchAll(/(^|[^\d])(\d{1,2})\s*號(?!\d)/g)) {
     const student = findStudentBySeatNumber(match[2], students);
     if (student) matches.push(buildStudentLabel(student));
   }
