@@ -3,7 +3,7 @@ const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { URL, URLSearchParams } = require('url');
+const { URL } = require('url');
 
 loadEnvFile();
 
@@ -21,6 +21,7 @@ const PENDING_DRAFT_TTL_MS = 30 * 60 * 1000;
 const STUDENT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const pendingAbsenceDrafts = new Map();
+const pendingCounselingDrafts = new Map();
 const studentCache = { expiresAt: 0, students: [] };
 
 if (!LINE_CHANNEL_SECRET) console.warn('Missing LINE_CHANNEL_SECRET');
@@ -64,9 +65,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 404, { ok: false, error: 'Not found' });
   } catch (error) {
     console.error('[server]', error && error.stack ? error.stack : error);
-    if (!res.headersSent) {
-      return sendJson(res, 500, { ok: false, error: 'Internal server error' });
-    }
+    if (!res.headersSent) return sendJson(res, 500, { ok: false, error: 'Internal server error' });
   }
 });
 
@@ -102,11 +101,26 @@ async function processWebhookPayload(payload) {
         continue;
       }
 
+      if (isConfirmCounselingCommand(text)) {
+        await confirmPendingCounseling(replyToken, userId);
+        continue;
+      }
+
+      if (isCancelCounselingCommand(text)) {
+        await cancelPendingCounseling(replyToken, userId);
+        continue;
+      }
+
       const dateStr = parseQueryDate(text);
       if (dateStr) {
         const digest = await fetchLineDigest(dateStr);
         await respondToLineEvent(replyToken, userId, buildFlexMessage(digest));
         console.log(`[event ${dateStr}] delivered`);
+        continue;
+      }
+
+      if (looksLikeCounselingMessage(text)) {
+        await prepareCounselingDraft(replyToken, userId, text);
         continue;
       }
 
@@ -121,6 +135,20 @@ async function processWebhookPayload(payload) {
       }).catch((deliveryError) => {
         console.error('[delivery fallback]', deliveryError && deliveryError.stack ? deliveryError.stack : deliveryError);
       });
+    }
+  }
+}
+
+function cleanupExpiredDrafts() {
+  const now = Date.now();
+  cleanupExpiredDraftMap(pendingAbsenceDrafts, now);
+  cleanupExpiredDraftMap(pendingCounselingDrafts, now);
+}
+
+function cleanupExpiredDraftMap(map, now) {
+  for (const [userId, draft] of map.entries()) {
+    if (!draft || !draft.createdAt || now - draft.createdAt > PENDING_DRAFT_TTL_MS) {
+      map.delete(userId);
     }
   }
 }
@@ -144,43 +172,110 @@ function parseQueryDate(text) {
   }
 
   const mdMatch = value.match(/^(\d{1,2})[/-](\d{1,2})$/);
-  if (mdMatch) {
-    return `${Number(mdMatch[1])}/${Number(mdMatch[2])}`;
-  }
+  if (mdMatch) return `${Number(mdMatch[1])}/${Number(mdMatch[2])}`;
 
   return null;
 }
 
 function looksLikeAbsenceMessage(text) {
-  const value = normalizeAbsenceText(text);
+  const value = normalizeText(text);
+  if (looksLikeCounselingMessage(value)) return false;
   const keywords = [
-    '請假', '病假', '事假', '公假', '喪假', '曠課', '遲到', '早退', '退餐',
-    '身體不舒服', '不舒服', '發燒', '感冒', '咳嗽', '腸胃炎', '腹瀉',
-    '看醫生', '就醫', '回診', '住院', '家裡有事', '臨時有事',
-    '無法到校', '不能到校', '不克到校', '在家休息'
+    '請假', '病假', '事假', '公假', '喪假', '曠課',
+    '遲到', '早退', '退餐', '停餐', '不用餐', '不退餐',
+    '看醫生', '發燒', '身體不舒服', '家裡有事', '比賽', '告別式'
   ];
   return keywords.some((keyword) => value.includes(keyword));
 }
 
+function looksLikeCounselingMessage(text) {
+  const value = normalizeText(text);
+  return value.startsWith('輔導：') || value.startsWith('輔導:');
+}
+
 function isConfirmAbsenceCommand(text) {
   const value = String(text || '').trim();
-  return value === '確認' || value === '確認請假' || value === '送出請假';
+  return value === '確認請假' || value === '確認' || value === '送出請假';
 }
 
 function isCancelAbsenceCommand(text) {
   const value = String(text || '').trim();
-  return value === '取消' || value === '取消請假';
+  return value === '取消請假' || value === '取消';
+}
+
+function isConfirmCounselingCommand(text) {
+  const value = String(text || '').trim();
+  return value === '確認輔導' || value === '送出輔導';
+}
+
+function isCancelCounselingCommand(text) {
+  const value = String(text || '').trim();
+  return value === '取消輔導';
+}
+
+async function fetchLineDigest(dateStr) {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'getLineDigest');
+  gasUrl.searchParams.set('date', dateStr);
+
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || 'GAS returned an error');
+  return response;
+}
+
+async function fetchStudentList() {
+  const now = Date.now();
+  if (studentCache.expiresAt > now && Array.isArray(studentCache.students) && studentCache.students.length) {
+    return studentCache.students;
+  }
+
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'getStudentList');
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '無法取得學生名單');
+
+  studentCache.students = Array.isArray(response.students) ? response.students : [];
+  studentCache.expiresAt = now + STUDENT_CACHE_TTL_MS;
+  return studentCache.students;
+}
+
+async function saveAbsenceRecordToGas(record) {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'saveAbsenceRecord');
+  gasUrl.searchParams.set('data', JSON.stringify(record));
+
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '寫入出缺席失敗');
+  return response;
+}
+
+async function fetchAiCounselingStrategy(student, reason, related) {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'getAiCounselingStrategy');
+  gasUrl.searchParams.set('student', student || '');
+  gasUrl.searchParams.set('reason', reason || '');
+  gasUrl.searchParams.set('related', related || '');
+
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '取得 AI 輔導建議失敗');
+  return String(response.strategy || '').trim();
+}
+
+async function saveCounselingRecordToGas(record) {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'saveCounselingRecord');
+  gasUrl.searchParams.set('data', JSON.stringify(record));
+
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '寫入輔導紀錄失敗');
+  return response;
 }
 
 async function prepareAbsenceDraft(replyToken, userId, rawText) {
   const students = await fetchStudentList();
   const records = buildParsedAbsenceRecords(rawText, students);
-  if (!records.length) {
-    throw new Error('找不到可辨識的請假學生，請補上座號或姓名');
-  }
-  if (!userId) {
-    throw new Error('目前無法建立請假草稿，因為缺少使用者識別');
-  }
+  if (!records.length) throw new Error('無法辨識請假對象，請補上座號或姓名。');
+  if (!userId) throw new Error('缺少 userId，無法建立請假草稿。');
 
   pendingAbsenceDrafts.set(userId, {
     createdAt: Date.now(),
@@ -194,15 +289,13 @@ async function prepareAbsenceDraft(replyToken, userId, rawText) {
 }
 
 async function confirmPendingAbsence(replyToken, userId) {
-  if (!userId) {
-    throw new Error('目前無法確認請假，因為缺少使用者識別');
-  }
+  if (!userId) throw new Error('缺少 userId，無法確認請假。');
 
   const pending = pendingAbsenceDrafts.get(userId);
   if (!pending || !Array.isArray(pending.records) || !pending.records.length) {
     await respondToLineEvent(replyToken, userId, {
       type: 'text',
-      text: '目前沒有待確認的請假草稿。請先傳送請假訊息。'
+      text: '目前沒有待確認的請假草稿。'
     });
     return;
   }
@@ -214,7 +307,7 @@ async function confirmPendingAbsence(replyToken, userId) {
   pendingAbsenceDrafts.delete(userId);
   await respondToLineEvent(replyToken, userId, {
     type: 'text',
-    text: `已記錄 ${pending.records.length} 筆出缺席資料。`
+    text: `已成功寫入 ${pending.records.length} 筆出缺席紀錄。`
   });
 }
 
@@ -222,66 +315,59 @@ async function cancelPendingAbsence(replyToken, userId) {
   if (userId) pendingAbsenceDrafts.delete(userId);
   await respondToLineEvent(replyToken, userId, {
     type: 'text',
-    text: '已取消待確認的請假草稿。'
+    text: '已取消本次請假草稿。'
   });
 }
 
-function cleanupExpiredDrafts() {
-  const now = Date.now();
-  for (const [userId, draft] of pendingAbsenceDrafts.entries()) {
-    if (!draft || !draft.createdAt || now - draft.createdAt > PENDING_DRAFT_TTL_MS) {
-      pendingAbsenceDrafts.delete(userId);
-    }
-  }
-}
+async function prepareCounselingDraft(replyToken, userId, rawText) {
+  const students = await fetchStudentList();
+  const record = buildParsedCounselingDraft(rawText, students);
+  if (!record) throw new Error('無法辨識輔導對象，請補上座號或姓名。');
+  if (!userId) throw new Error('缺少 userId，無法建立輔導草稿。');
 
-async function fetchLineDigest(dateStr) {
-  const gasUrl = new URL(GAS_BASE_URL);
-  gasUrl.searchParams.set('action', 'getLineDigest');
-  gasUrl.searchParams.set('date', dateStr);
+  record.strategy = await fetchAiCounselingStrategy(record.student, record.reason, record.related);
 
-  const response = await requestJson(gasUrl, { method: 'GET' });
-  if (!response.ok) {
-    throw new Error(response.error || 'GAS returned an error');
-  }
-  return response;
-}
-
-async function fetchStudentList() {
-  const now = Date.now();
-  if (studentCache.expiresAt > now && Array.isArray(studentCache.students) && studentCache.students.length) {
-    return studentCache.students;
-  }
-
-  const gasUrl = new URL(GAS_BASE_URL);
-  gasUrl.searchParams.set('action', 'getStudentList');
-  const response = await requestJson(gasUrl, { method: 'GET' });
-  if (!response.ok) {
-    throw new Error(response.error || '無法取得學生名單');
-  }
-
-  studentCache.students = Array.isArray(response.students) ? response.students : [];
-  studentCache.expiresAt = now + STUDENT_CACHE_TTL_MS;
-  return studentCache.students;
-}
-
-async function saveAbsenceRecordToGas(record) {
-  const gasUrl = new URL(GAS_BASE_URL);
-  gasUrl.searchParams.set('action', 'saveAbsenceRecord');
-  gasUrl.searchParams.set('data', JSON.stringify(record));
-
-  const response = await requestJson(gasUrl, {
-    method: 'GET'
+  pendingCounselingDrafts.set(userId, {
+    createdAt: Date.now(),
+    record
   });
 
-  if (!response.ok) {
-    throw new Error(response.error || '寫入出缺席資料失敗');
+  await respondToLineEvent(replyToken, userId, {
+    type: 'text',
+    text: buildCounselingDraftSummary(record)
+  });
+}
+
+async function confirmPendingCounseling(replyToken, userId) {
+  if (!userId) throw new Error('缺少 userId，無法確認輔導紀錄。');
+
+  const pending = pendingCounselingDrafts.get(userId);
+  if (!pending || !pending.record) {
+    await respondToLineEvent(replyToken, userId, {
+      type: 'text',
+      text: '目前沒有待確認的輔導紀錄草稿。'
+    });
+    return;
   }
-  return response;
+
+  await saveCounselingRecordToGas(pending.record);
+  pendingCounselingDrafts.delete(userId);
+  await respondToLineEvent(replyToken, userId, {
+    type: 'text',
+    text: '已成功寫入 1 筆輔導紀錄。'
+  });
+}
+
+async function cancelPendingCounseling(replyToken, userId) {
+  if (userId) pendingCounselingDrafts.delete(userId);
+  await respondToLineEvent(replyToken, userId, {
+    type: 'text',
+    text: '已取消本次輔導草稿。'
+  });
 }
 
 function buildParsedAbsenceRecords(text, students) {
-  const normalizedText = normalizeAbsenceText(text);
+  const normalizedText = normalizeText(text);
   const mode = inferModeFromText(normalizedText);
   const studentLabels = inferStudentsFromText(normalizedText, students);
   if (!studentLabels.length) return [];
@@ -290,8 +376,8 @@ function buildParsedAbsenceRecords(text, students) {
   const durationDays = inferDurationDays(normalizedText);
   const noticeDate = todayIso();
   const startDate = dates[0] || noticeDate;
-
   let endDate = dates[1] || startDate;
+
   if (mode === 'leave' && dates.length <= 1 && durationDays && durationDays > 1) {
     endDate = addWeekdays(startDate, durationDays - 1);
   }
@@ -327,15 +413,101 @@ function buildParsedAbsenceRecords(text, students) {
   }));
 }
 
+function buildParsedCounselingDraft(text, students) {
+  const body = stripCounselingPrefix(text);
+  const normalizedText = normalizeText(body);
+  const selectedStudents = inferStudentsFromText(normalizedText, students);
+  if (!selectedStudents.length) return null;
+
+  const primaryStudent = selectedStudents[0];
+  const relatedStudents = selectedStudents.slice(1);
+  const period = inferCounselingPeriod(normalizedText);
+  const dateIso = parseDateTokens(normalizedText)[0] || todayIso();
+  const reason = buildCounselingReason(body, selectedStudents);
+  const related = relatedStudents.join('、');
+
+  return {
+    date: dateIso,
+    period,
+    student: primaryStudent,
+    reason,
+    related,
+    informant: 'LINE',
+    contact: '',
+    contactContent: '',
+    strategy: '',
+    selectedStudents
+  };
+}
+
+function buildCounselingReason(text, selectedStudents) {
+  let reason = String(text || '').trim();
+  for (const label of selectedStudents) {
+    reason = reason.replace(new RegExp(escapeRegExp(label), 'g'), ' ');
+    const parts = String(label).split(/\s+/);
+    if (parts[1]) {
+      reason = reason.replace(new RegExp(escapeRegExp(parts[1]), 'g'), ' ');
+    }
+    if (parts[0]) {
+      reason = reason.replace(new RegExp(`${escapeRegExp(parts[0])}\\s*號?`, 'g'), ' ');
+    }
+  }
+  reason = reason
+    .replace(/輔導[:：]?/g, ' ')
+    .replace(/今天|今日|明天|昨天|後天/g, ' ')
+    .replace(/第?\s*(晨光|[1-7])\s*節/g, ' ')
+    .replace(/\d{1,2}[\/.-]\d{1,2}(?:\s*[-~～到至]\s*\d{1,2}[\/.-]\d{1,2})?/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return reason || String(text || '').trim();
+}
+
+function inferCounselingPeriod(text) {
+  if (/晨光/.test(text)) return '晨光';
+  const numberedMatch = String(text || '').match(/第?\s*([1-7])\s*節/);
+  if (numberedMatch) return numberedMatch[1];
+  return '';
+}
+
+function buildAbsenceDraftSummary(records) {
+  const lines = ['請假分析結果：'];
+  records.forEach((record, index) => {
+    lines.push(
+      `${index + 1}. ${record.selectedStudents[0]}`,
+      `日期：${record.startDate}${record.endDate && record.endDate !== record.startDate ? ` ~ ${record.endDate}` : ''}`,
+      `類型：${record.leaveType}`,
+      `節數：${record.periods || '未填'}`,
+      `日數：${record.days || '未填'}`,
+      `退餐：${record.meal || '未填'}`,
+      `退餐判定：${record.mealReturned ? '可退' : '不可退'}`,
+      `說明：${record.mealRuleMessage || '無'}`
+    );
+  });
+  lines.push('', '回覆「確認請假」即可寫入出缺席，回覆「取消請假」可放棄。');
+  return lines.join('\n');
+}
+
+function buildCounselingDraftSummary(record) {
+  return [
+    '輔導紀錄草稿：',
+    `日期：${record.date || '未填'}`,
+    `節次：${record.period || '未填'}`,
+    `學生：${record.student || '未填'}`,
+    `相關人員：${record.related || '無'}`,
+    `事由：${record.reason || '未填'}`,
+    '',
+    'AI 輔導紀錄：',
+    record.strategy || '（AI 未產生內容）',
+    '',
+    '回覆「確認輔導」即可寫入輔導紀錄，回覆「取消輔導」可放棄。'
+  ].join('\n');
+}
+
 function resolvePeriodsValue(mode, startDate, endDate, inferredPeriods, days) {
   if (mode !== 'leave') return '';
   if (inferredPeriods) return inferredPeriods;
-
   const schoolDays = countWeekdaysInclusive(startDate, endDate);
-  if (schoolDays > 1) {
-    return String(schoolDays * 7);
-  }
-
+  if (schoolDays > 1) return String(schoolDays * 7);
   if (String(days || '') === '0.5') return '4';
   return '7';
 }
@@ -349,59 +521,33 @@ function evaluateMealRule(input) {
   const schoolDays = countWeekdaysInclusive(startDate, endDate);
   const leadDays = calculateLeadDays(noticeDate, startDate);
 
-  if (meal !== '是') {
-    return { eligible: false, message: '未申請退餐。' };
-  }
+  if (meal !== '是') return { eligible: false, message: '未申請退餐。' };
 
   if (leaveType === '病假') {
     if (schoolDays >= 3) {
-      return {
-        eligible: true,
-        message: `符合病假退餐規則：連續 ${schoolDays} 個上課日，通知當日不退費。`
-      };
+      return { eligible: true, message: `符合病假退餐規則：連續 ${schoolDays} 個上課日以上，但通知當日不退費。` };
     }
-    return {
-      eligible: false,
-      message: `不符合病假退餐規則：病假需連續 3 個上課日以上，目前僅 ${schoolDays} 個上課日。`
-    };
+    return { eligible: false, message: `不符合病假退餐規則：病假需連續 3 個上課日以上，目前僅 ${schoolDays} 個上課日。` };
   }
 
   if (leaveType === '事假') {
     if (schoolDays < 5) {
-      return {
-        eligible: false,
-        message: `不符合事假退餐規則：事假需連續 5 個上課日以上，目前僅 ${schoolDays} 個上課日。`
-      };
+      return { eligible: false, message: `不符合事假退餐規則：事假需連續 5 個上課日以上，目前僅 ${schoolDays} 個上課日。` };
     }
     if (leadDays < 7) {
-      return {
-        eligible: false,
-        message: `不符合事假退餐規則：事假需至少 7 天前通知，目前僅提前 ${leadDays} 天。`
-      };
+      return { eligible: false, message: `不符合事假退餐規則：事假需 7 天前通知，目前僅提前 ${leadDays} 天。` };
     }
-    return {
-      eligible: true,
-      message: `符合事假退餐規則：連續 ${schoolDays} 個上課日，且已提前 ${leadDays} 天通知。`
-    };
+    return { eligible: true, message: `符合事假退餐規則：連續 ${schoolDays} 個上課日，且提前 ${leadDays} 天通知。` };
   }
 
   if (leaveType === '公假') {
     if (leadDays < 7) {
-      return {
-        eligible: false,
-        message: `不符合公假退餐規則：公假需至少 7 天前通知，目前僅提前 ${leadDays} 天。`
-      };
+      return { eligible: false, message: `不符合公假退餐規則：公假需 7 天前通知，目前僅提前 ${leadDays} 天。` };
     }
-    return {
-      eligible: true,
-      message: `符合公假退餐規則：已提前 ${leadDays} 天通知。`
-    };
+    return { eligible: true, message: `符合公假退餐規則：已提前 ${leadDays} 天通知。` };
   }
 
-  return {
-    eligible: false,
-    message: `目前 ${leaveType || '此假別'} 未符合可退餐規則。`
-  };
+  return { eligible: false, message: `${leaveType || '此假別'} 不符合目前設定的退餐規則。` };
 }
 
 function calculateLeadDays(noticeDate, startDate) {
@@ -410,24 +556,6 @@ function calculateLeadDays(noticeDate, startDate) {
   if (!notice || !start) return 0;
   const diffMs = start.getTime() - notice.getTime();
   return Math.max(0, Math.floor(diffMs / (24 * 60 * 60 * 1000)));
-}
-
-function buildAbsenceDraftSummary(records) {
-  const lines = ['請假分析結果：'];
-  records.forEach((record, index) => {
-    lines.push(
-      `${index + 1}. ${record.selectedStudents[0]}`,
-      `日期：${record.startDate}${record.endDate && record.endDate !== record.startDate ? ` ~ ${record.endDate}` : ''}`,
-      `類型：${record.leaveType}`,
-      `節數：${record.periods || '—'}`,
-      `日數：${record.days || '—'}`,
-      `退餐：${record.meal || '否'}`,
-      `退餐判定：${record.mealReturned ? '可退' : '不可退'}`,
-      `說明：${record.mealRuleMessage || '—'}`
-    );
-  });
-  lines.push('', '回覆「確認請假」即可寫入出缺席，回覆「取消請假」可放棄。');
-  return lines.join('\n');
 }
 
 function todayIso() {
@@ -461,26 +589,28 @@ function formatMdDate(dateObj) {
 }
 
 function toIsoFromParts(year, month, day) {
-  return [
-    String(year),
-    String(month).padStart(2, '0'),
-    String(day).padStart(2, '0')
-  ].join('-');
+  return [String(year), String(month).padStart(2, '0'), String(day).padStart(2, '0')].join('-');
 }
 
 function parseIsoDate(iso) {
   if (!iso) return null;
-  const date = new Date(`${iso}T00:00:00`);
+  const match = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function normalizeAbsenceText(text) {
+function normalizeText(text) {
   return String(text || '')
     .replace(/\u3000/g, ' ')
-    .replace(/[，、；：]/g, ' ')
-    .replace(/\s*([\/.\-~～])\s*/g, '$1')
+    .replace(/[，、。；：]/g, ' ')
+    .replace(/\s*([/.\-~～到至])\s*/g, '$1')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function stripCounselingPrefix(text) {
+  return String(text || '').replace(/^輔導[:：]?\s*/, '').trim();
 }
 
 function addWeekdays(startIso, extraDays) {
@@ -523,34 +653,37 @@ function calculateDays(startIso, endIso, periods) {
 }
 
 function parseDateTokens(text) {
+  const value = String(text || '');
   const today = getTodayInTimeZone();
   const currentYear = today.getFullYear();
   const results = [];
 
-  if (text.includes('今天') || text.includes('今日')) {
-    results.push(toIsoFromParts(today.getFullYear(), today.getMonth() + 1, today.getDate()));
-  }
-  if (text.includes('明天')) {
+  if (value.includes('今天') || value.includes('今日')) results.push(todayIso());
+  if (value.includes('明天')) {
     const next = addCalendarDays(today, 1);
     results.push(toIsoFromParts(next.getFullYear(), next.getMonth() + 1, next.getDate()));
   }
-  if (text.includes('後天')) {
+  if (value.includes('後天')) {
     const next = addCalendarDays(today, 2);
     results.push(toIsoFromParts(next.getFullYear(), next.getMonth() + 1, next.getDate()));
   }
-
-  for (const match of text.matchAll(/(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})/g)) {
-    results.push(toIsoFromParts(parseInt(match[1], 10), parseInt(match[2], 10), parseInt(match[3], 10)));
+  if (value.includes('昨天')) {
+    const prev = addCalendarDays(today, -1);
+    results.push(toIsoFromParts(prev.getFullYear(), prev.getMonth() + 1, prev.getDate()));
   }
 
-  for (const match of text.matchAll(/(^|[^\d])(\d{1,2})[\/.-](\d{1,2})(?!\d)/g)) {
-    results.push(toIsoFromParts(currentYear, parseInt(match[2], 10), parseInt(match[3], 10)));
+  for (const match of value.matchAll(/(\d{4})[\/.-](\d{1,2})[\/.-](\d{1,2})/g)) {
+    results.push(toIsoFromParts(Number(match[1]), Number(match[2]), Number(match[3])));
   }
 
-  for (const match of text.matchAll(/(下週|下周|這週|這周|本週|本周|週|星期|禮拜)([一二三四五六日天])/g)) {
+  for (const match of value.matchAll(/(^|[^\d])(\d{1,2})[\/.-](\d{1,2})(?!\d)/g)) {
+    results.push(toIsoFromParts(currentYear, Number(match[2]), Number(match[3])));
+  }
+
+  for (const match of value.matchAll(/(下週|下礼拜|下禮拜|這週|這周|本週|本周|週|星期|禮拜)([一二三四五六日天])/g)) {
     const weekdayIndex = weekdayTextToIndex(match[2]);
     if (weekdayIndex === -1) continue;
-    const useNextWeek = match[1] === '下週' || match[1] === '下周';
+    const useNextWeek = /^下/.test(match[1]);
     const resolved = findUpcomingWeekday(today, weekdayIndex, useNextWeek);
     results.push(toIsoFromParts(resolved.getFullYear(), resolved.getMonth() + 1, resolved.getDate()));
   }
@@ -560,52 +693,43 @@ function parseDateTokens(text) {
 
 function stripDatePhrases(text) {
   return String(text || '')
-    .replace(/今天|今日|明天|後天/g, ' ')
-    .replace(/(下週|下周|這週|這周|本週|本周|週|星期|禮拜)[一二三四五六日天]/g, ' ')
-    .replace(/\d{1,2}[\/.-]\d{1,2}\s*[-~～]\s*\d{1,2}[\/.-]\d{1,2}/g, ' ')
-    .replace(/\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}\s*[-~～]\s*\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}/g, ' ')
+    .replace(/今天|今日|明天|昨天|後天/g, ' ')
+    .replace(/(下週|下礼拜|下禮拜|這週|這周|本週|本周|週|星期|禮拜)[一二三四五六日天]/g, ' ')
+    .replace(/\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}\s*[-~～到至]\s*\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}/g, ' ')
+    .replace(/\d{1,2}[\/.-]\d{1,2}\s*[-~～到至]\s*\d{1,2}[\/.-]\d{1,2}/g, ' ')
     .replace(/\d{4}[\/.-]\d{1,2}[\/.-]\d{1,2}/g, ' ')
     .replace(/\d{1,2}[\/.-]\d{1,2}/g, ' ');
 }
 
 function inferModeFromText(text) {
-  if (text.includes('早退')) return 'early';
-  if (text.includes('遲到')) return 'late';
+  if (String(text).includes('早退')) return 'early';
+  if (String(text).includes('遲到')) return 'late';
   return 'leave';
 }
 
 function inferLeaveTypeFromText(text) {
-  const explicit = LEAVE_TYPES.find((type) => text.includes(type));
+  const explicit = LEAVE_TYPES.find((type) => String(text).includes(type));
   if (explicit) return explicit;
-
-  if (/(身體不舒服|不舒服|發燒|感冒|咳嗽|腸胃炎|腹瀉|頭痛|看醫生|就醫|回診|住院|請病假)/.test(text)) {
-    return '病假';
-  }
-  if (/(家裡有事|臨時有事|私人因素|家中有事|返鄉|掃墓|祭祖|旅遊|出國)/.test(text)) {
-    return '事假';
-  }
-  if (/(比賽|演出|校外|代表隊|受訓|活動|參訪|公務)/.test(text)) {
-    return '公假';
-  }
-  if (/(喪禮|告別式|治喪)/.test(text)) {
-    return '喪假';
-  }
+  if (/(身體不舒服|發燒|看醫生|不適|腸胃炎|感冒)/.test(text)) return '病假';
+  if (/(家裡有事|臨時有事|私事|事假)/.test(text)) return '事假';
+  if (/(比賽|活動|公假|校隊|代表隊)/.test(text)) return '公假';
+  if (/(告別式|喪禮|治喪|奔喪)/.test(text)) return '喪假';
   return '事假';
 }
 
 function inferMealChoiceFromText(text) {
-  if (/(不退餐|免退餐|不用退餐|不用訂餐|午餐照常|有吃午餐)/.test(text)) return '否';
-  if (/(退餐|停餐|不用餐|午餐不用|不吃午餐|取消午餐)/.test(text)) return '是';
+  if (/(不退餐|午餐照常|不用退餐)/.test(text)) return '否';
+  if (/(退餐|停餐|不用餐|午餐退費|營養午餐.*退)/.test(text)) return '是';
   return null;
 }
 
 function inferPeriodsFromText(text) {
   const normalized = String(text || '')
-    .replace(/第/g, '')
-    .replace(/節/g, '')
-    .replace(/[到至～~]/g, '-');
+    .replace(/節課/g, '節')
+    .replace(/到/g, '-')
+    .replace(/[～~至]/g, '-');
 
-  const rangeMatch = normalized.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/);
+  const rangeMatch = normalized.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*節/);
   if (rangeMatch) {
     const start = parseFloat(rangeMatch[1]);
     const end = parseFloat(rangeMatch[2]);
@@ -614,28 +738,28 @@ function inferPeriodsFromText(text) {
     }
   }
 
-  const singleMatch = text.match(/(\d+(?:\.\d+)?)\s*節/);
+  const singleMatch = normalized.match(/(\d+(?:\.\d+)?)\s*節/);
   if (singleMatch) return String(singleMatch[1]);
 
-  if (/(整天|全天|一天|全日)/.test(text)) return '7';
-  if (/(半天|早上|上午|中午接回|午前|早退回家)/.test(text)) return '4';
-  if (/(下午|午休後|午後)/.test(text)) return '3';
+  if (/(整天|一天|全天)/.test(text)) return '7';
+  if (/(半天|上午|早上|中午接回)/.test(text)) return '4';
+  if (/(下午)/.test(text)) return '3';
   return '';
 }
 
 function inferDurationDays(text) {
   const numericMatch = String(text || '').match(/(\d+)\s*天/);
-  if (numericMatch) return parseInt(numericMatch[1], 10);
+  if (numericMatch) return Number(numericMatch[1]);
 
   const chineseDayMap = { 一: 1, 二: 2, 兩: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7 };
   const chineseMatch = String(text || '').match(/([一二兩三四五六七])\s*天/);
   if (chineseMatch) return chineseDayMap[chineseMatch[1]] || null;
-  if (/半天/.test(text)) return 1;
+  if (/一天/.test(text)) return 1;
   return null;
 }
 
 function inferStudentsFromText(text, students) {
-  if (text.includes('全班')) return ['全班'];
+  if (String(text).includes('全班')) return ['全班'];
 
   const matches = [];
   const textWithoutDates = stripDatePhrases(text);
@@ -706,19 +830,17 @@ function buildFlexMessage(digest) {
   const contactText = String(digest.contact || '').trim();
   const headerText = `📅 ${digest.dayLabel || digest.date || ''}${digest.todayKey ? `　${digest.todayKey}` : ''}`;
 
-  const tableRows = [
-    {
-      type: 'box',
-      layout: 'horizontal',
-      backgroundColor: '#dce8fb',
-      paddingAll: '8px',
-      contents: [
-        { type: 'text', text: '節', size: 'lg', flex: 1, align: 'center', weight: 'bold', color: '#2a4070' },
-        { type: 'text', text: '進度', size: 'lg', flex: 5, weight: 'bold', color: '#2a4070' },
-        { type: 'text', text: '備註', size: 'lg', flex: 4, weight: 'bold', color: '#2a4070' }
-      ]
-    }
-  ];
+  const tableRows = [{
+    type: 'box',
+    layout: 'horizontal',
+    backgroundColor: '#dce8fb',
+    paddingAll: '8px',
+    contents: [
+      { type: 'text', text: '節', size: 'lg', flex: 1, align: 'center', weight: 'bold', color: '#2a4070' },
+      { type: 'text', text: '進度', size: 'lg', flex: 5, weight: 'bold', color: '#2a4070' },
+      { type: 'text', text: '備註', size: 'lg', flex: 4, weight: 'bold', color: '#2a4070' }
+    ]
+  }];
 
   if (periods.length) {
     for (const period of periods) {
@@ -728,7 +850,15 @@ function buildFlexMessage(digest) {
         backgroundColor: getRowColor(period),
         paddingAll: '8px',
         contents: [
-          { type: 'text', text: period.period === '晨光' ? '晨' : String(period.period || ''), size: 'lg', flex: 1, align: 'center', color: '#5c6f92', weight: 'bold' },
+          {
+            type: 'text',
+            text: period.period === '晨光' ? '晨' : String(period.period || ''),
+            size: 'lg',
+            flex: 1,
+            align: 'center',
+            color: '#5c6f92',
+            weight: 'bold'
+          },
           { type: 'text', text: String(period.content || '－'), size: 'lg', flex: 5, wrap: true, color: '#243b63' },
           { type: 'text', text: String(period.note || '　'), size: 'lg', flex: 4, wrap: true, color: '#50627f' }
         ]
@@ -876,8 +1006,10 @@ function requestJson(targetUrl, options, redirectCount) {
   return new Promise((resolve, reject) => {
     const currentRedirectCount = Number(redirectCount || 0);
     const url = typeof targetUrl === 'string' ? new URL(targetUrl) : targetUrl;
+    const requestOptions = Object.assign({}, options || {});
     const client = url.protocol === 'https:' ? https : http;
-    const request = client.request(url, options || {}, (response) => {
+
+    const request = client.request(url, requestOptions, (response) => {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
       response.on('end', () => {
@@ -889,10 +1021,16 @@ function requestJson(targetUrl, options, redirectCount) {
             return reject(new Error(`HTTP ${statusCode}: too many redirects`));
           }
           const nextUrl = new URL(response.headers.location, url);
-          const nextOptions = Object.assign({}, options || {});
+          const nextOptions = Object.assign({}, requestOptions);
           if (statusCode === 303) {
             nextOptions.method = 'GET';
             delete nextOptions.body;
+            if (nextOptions.headers) {
+              delete nextOptions.headers['Content-Length'];
+              delete nextOptions.headers['content-length'];
+              delete nextOptions.headers['Content-Type'];
+              delete nextOptions.headers['content-type'];
+            }
           }
           return resolve(requestJson(nextUrl, nextOptions, currentRedirectCount + 1));
         }
@@ -912,12 +1050,12 @@ function requestJson(targetUrl, options, redirectCount) {
         }
 
         if (statusCode >= 200 && statusCode < 300) return resolve(parsed);
-        reject(new Error(`HTTP ${statusCode}: ${parsed.error || raw}`));
+        return reject(new Error(`HTTP ${statusCode}: ${parsed.error || raw}`));
       });
     });
 
     request.on('error', reject);
-    if (options && options.body) request.write(options.body);
+    if (requestOptions.body) request.write(requestOptions.body);
     request.end();
   });
 }
@@ -946,4 +1084,8 @@ function loadEnvFile() {
     const value = trimmed.slice(equalIndex + 1).trim();
     if (!process.env[key]) process.env[key] = value;
   }
+}
+
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
