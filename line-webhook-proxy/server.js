@@ -111,6 +111,19 @@ async function processWebhookPayload(payload) {
         continue;
       }
 
+      if (isTodoListCommand(text)) {
+        const items = await fetchTodoItemsFromGas();
+        await respondToLineEvent(replyToken, userId, buildTodoFlexMessage(items));
+        continue;
+      }
+
+      const addTodoMatch = parseAddTodoCommand(text);
+      if (addTodoMatch) {
+        const items = await addTodoItemToGas(addTodoMatch.task, addTodoMatch.dueDate);
+        await respondToLineEvent(replyToken, userId, buildTodoFlexMessage(items));
+        continue;
+      }
+
       const dateStr = parseQueryDate(text);
       if (dateStr) {
         const digest = await fetchLineDigest(dateStr);
@@ -821,6 +834,110 @@ function findUpcomingWeekday(baseDate, targetWeekday, forceNextWeek) {
   if (forceNextWeek || delta === 0) delta += 7;
   base.setDate(base.getDate() + delta);
   return base;
+}
+
+function isTodoListCommand(text) {
+  const value = String(text || '').trim();
+  return value === '待辦' || value === '待辦事項';
+}
+
+function parseAddTodoCommand(text) {
+  const value = String(text || '').trim();
+  const match = value.match(/^(?:\+待辦|新增待辦)\s+(.+)$/);
+  if (!match) return null;
+
+  const rest = match[1].trim();
+  const datePattern = /(?:截止\s*)?(\d{4}-\d{2}-\d{2}|\d{1,2}[\/月]\d{1,2}日?)$/;
+  const dateMatch = rest.match(datePattern);
+
+  let task = rest;
+  let dueDate = '';
+  if (dateMatch) {
+    const candidate = rest.slice(0, rest.length - dateMatch[0].length).trim();
+    if (candidate) {
+      task = candidate;
+      dueDate = dateMatch[1].replace(/月/, '/').replace(/日$/, '');
+    }
+  }
+
+  return { task, dueDate };
+}
+
+async function fetchTodoItemsFromGas() {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'getTodoItems');
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '無法取得待辦事項');
+  return Array.isArray(response.items) ? response.items : [];
+}
+
+async function addTodoItemToGas(task, dueDate) {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'addTodoItem');
+  gasUrl.searchParams.set('task', task);
+  if (dueDate) gasUrl.searchParams.set('dueDate', dueDate);
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '新增待辦事項失敗');
+  return Array.isArray(response.items) ? response.items : [];
+}
+
+function buildTodoFlexMessage(items) {
+  const active = (items || []).filter((item) => item.task);
+  const rows = [];
+
+  if (!active.length) {
+    rows.push({
+      type: 'box', layout: 'vertical', paddingAll: '12px',
+      contents: [{ type: 'text', text: '（目前沒有待辦事項）', size: 'lg', color: '#aaaaaa', align: 'center' }]
+    });
+  } else {
+    for (const item of active) {
+      const mark = item.checked ? '✅' : '⬜';
+      const textColor = item.checked ? '#aaaaaa' : '#243b63';
+      const bg = item.checked ? '#f5f5f5' : '#ffffff';
+      const label = (item.itemNo ? `${item.itemNo}. ` : '') + item.task;
+      const rowContents = [
+        { type: 'text', text: `${mark} ${label}`, size: 'lg', flex: 5, wrap: true, color: textColor }
+      ];
+      if (item.dueDate) {
+        rowContents.push({ type: 'text', text: String(item.dueDate), size: 'sm', flex: 2, align: 'end', color: '#888888', gravity: 'center' });
+      }
+      rows.push({ type: 'box', layout: 'horizontal', paddingAll: '8px', backgroundColor: bg, contents: rowContents });
+      rows.push({ type: 'separator', color: '#e0e8e0' });
+    }
+  }
+
+  return {
+    type: 'flex',
+    altText: '📝 待辦事項清單',
+    quickReply: {
+      items: [
+        { type: 'action', action: { type: 'message', label: '待辦清單', text: '待辦' } },
+        { type: 'action', action: { type: 'message', label: '今天進度', text: '今天' } }
+      ]
+    },
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+      header: {
+        type: 'box', layout: 'horizontal',
+        backgroundColor: '#e6f4e6', paddingAll: '12px',
+        contents: [{ type: 'text', text: '📝 待辦事項', weight: 'bold', size: 'xl', color: '#1a5c1a' }]
+      },
+      body: {
+        type: 'box', layout: 'vertical',
+        spacing: 'none',
+        paddingTop: '0px', paddingBottom: '0px',
+        paddingStart: 'lg', paddingEnd: 'lg',
+        contents: rows
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        backgroundColor: '#f0f7f0',
+        contents: [{ type: 'text', text: '輸入「+待辦 事項」新增　可加截止日期如「+待辦 訂便當 5/20」', size: 'sm', color: '#558855', align: 'center', wrap: true }]
+      }
+    }
+  };
 }
 
 function buildFlexMessage(digest) {
