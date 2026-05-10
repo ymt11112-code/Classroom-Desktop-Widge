@@ -111,6 +111,11 @@ async function processWebhookPayload(payload) {
         continue;
       }
 
+      if (isHelpCommand(text)) {
+        await respondToLineEvent(replyToken, userId, buildCommandHelpFlexMessage());
+        continue;
+      }
+
       if (isTodoListCommand(text)) {
         const items = await fetchTodoItemsFromGas();
         await respondToLineEvent(replyToken, userId, buildTodoFlexMessage(items));
@@ -896,6 +901,11 @@ function isClearCompletedTodoCommand(text) {
   return value === '清除已完成' || value === '清空已完成' || value === '清除完成';
 }
 
+function isHelpCommand(text) {
+  const value = String(text || '').trim();
+  return value === '指令說明' || value === 'help' || value === '？' || value === '?' || value === '登記';
+}
+
 function parseDeleteTodoCommand(text) {
   const value = String(text || '').trim();
 
@@ -1091,6 +1101,84 @@ function buildTodoFlexMessage(items) {
         backgroundColor: '#f0f7f0',
         contents: [{ type: 'text', text: '新增：+待辦 事項 5/20　勾選：完成待辦 1　刪除：刪除待辦 1', size: 'sm', color: '#558855', align: 'center', wrap: true }]
       }
+    }
+  };
+}
+
+function buildCommandHelpFlexMessage() {
+  return {
+    type: 'flex',
+    altText: '📋 LINE 指令說明',
+    contents: {
+      type: 'carousel',
+      contents: [
+        {
+          type: 'bubble', size: 'mega',
+          header: { type: 'box', layout: 'vertical', backgroundColor: '#e6f4e6', paddingAll: '12px', contents: [{ type: 'text', text: '📝 待辦事項 指令說明', weight: 'bold', size: 'lg', color: '#1a5c1a' }] },
+          body: {
+            type: 'box', layout: 'vertical', spacing: 'none', paddingAll: '0px',
+            contents: [
+              { type: 'box', layout: 'horizontal', backgroundColor: '#c8e4c8', paddingAll: '6px', contents: [{ type: 'text', text: '指令', size: 'xs', weight: 'bold', flex: 5, color: '#1a5c1a' }, { type: 'text', text: '效果', size: 'xs', weight: 'bold', flex: 7, color: '#1a5c1a' }] },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#f9fff9', contents: [{ type: 'text', text: '待辦', size: 'sm', weight: 'bold', flex: 5, color: '#2d7a2d', wrap: true }, { type: 'text', text: '顯示待辦清單', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c8e4c8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', contents: [{ type: 'text', text: '+待辦 訂便當', size: 'sm', weight: 'bold', flex: 5, color: '#2d7a2d', wrap: true }, { type: 'text', text: '新增（無截止日）', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c8e4c8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#f9fff9', contents: [{ type: 'text', text: '+待辦 訂便當 5/20', size: 'sm', weight: 'bold', flex: 5, color: '#2d7a2d', wrap: true }, { type: 'text', text: '新增＋截止日\n（支援中文日期）', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c8e4c8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', contents: [{ type: 'text', text: '完成1', size: 'sm', weight: 'bold', flex: 5, color: '#2d7a2d', wrap: true }, { type: 'text', text: '切換第1項勾選狀態', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c8e4c8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#f9fff9', contents: [{ type: 'text', text: '完成1,3,4\n完成134', size: 'sm', weight: 'bold', flex: 5, color: '#2d7a2d', wrap: true }, { type: 'text', text: '批次切換勾選\n（逗號或逐位數）', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c8e4c8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', contents: [{ type: 'text', text: '刪除待辦 2,3\n刪除2,3', size: 'sm', weight: 'bold', flex: 5, color: '#2d7a2d', wrap: true }, { type: 'text', text: '刪除並重新編號', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c8e4c8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#f9fff9', contents: [{ type: 'text', text: '清除已完成', size: 'sm', weight: 'bold', flex: 5, color: '#2d7a2d', wrap: true }, { type: 'text', text: '移除全部已完成項目', size: 'sm', flex: 7, wrap: true, color: '#444' }] }
+            ]
+          },
+          footer: { type: 'box', layout: 'vertical', backgroundColor: '#f0f7f0', paddingAll: '8px', contents: [{ type: 'text', text: '「新增待辦」可代替「+待辦」；截止日支援 5/20、五月二十日、截止日期… 等格式', size: 'xs', color: '#558855', wrap: true }] }
+        },
+        {
+          type: 'bubble', size: 'mega',
+          header: { type: 'box', layout: 'vertical', backgroundColor: '#e3eeff', paddingAll: '12px', contents: [{ type: 'text', text: '🏫 出缺席記錄 指令說明', weight: 'bold', size: 'lg', color: '#1a3a6a' }] },
+          body: {
+            type: 'box', layout: 'vertical', spacing: 'none', paddingAll: '0px',
+            contents: [
+              { type: 'box', layout: 'horizontal', backgroundColor: '#c0d4f0', paddingAll: '6px', contents: [{ type: 'text', text: '指令', size: 'xs', weight: 'bold', flex: 5, color: '#1a3a6a' }, { type: 'text', text: '效果', size: 'xs', weight: 'bold', flex: 7, color: '#1a3a6a' }] },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#f7faff', contents: [{ type: 'text', text: '7號宋珏 病假', size: 'sm', weight: 'bold', flex: 5, color: '#1a4a8a', wrap: true }, { type: 'text', text: '分析假別，產生請假草稿', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c0d4e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', contents: [{ type: 'text', text: '全班明天事假', size: 'sm', weight: 'bold', flex: 5, color: '#1a4a8a', wrap: true }, { type: 'text', text: '全班＋相對日期', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c0d4e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#f7faff', contents: [{ type: 'text', text: '3號 遲到', size: 'sm', weight: 'bold', flex: 5, color: '#1a4a8a', wrap: true }, { type: 'text', text: '遲到 / 早退記錄', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c0d4e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', contents: [{ type: 'text', text: '7號 看醫生，退餐', size: 'sm', weight: 'bold', flex: 5, color: '#1a4a8a', wrap: true }, { type: 'text', text: '推斷假別＋退餐申請', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c0d4e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#f7faff', contents: [{ type: 'text', text: '確認 / 確認請假\n送出請假', size: 'sm', weight: 'bold', flex: 5, color: '#1a4a8a', wrap: true }, { type: 'text', text: '草稿確認後寫入出缺席', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#c0d4e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', contents: [{ type: 'text', text: '取消 / 取消請假', size: 'sm', weight: 'bold', flex: 5, color: '#1a4a8a', wrap: true }, { type: 'text', text: '放棄草稿，不寫入', size: 'sm', flex: 7, wrap: true, color: '#444' }] }
+            ]
+          },
+          footer: { type: 'box', layout: 'vertical', backgroundColor: '#eef2ff', paddingAll: '8px', contents: [{ type: 'text', text: '退餐規則：病假連續3日｜事假5日+7天前通知｜公假7天前通知', size: 'xs', color: '#3355aa', wrap: true }, { type: 'text', text: '觸發關鍵字：病假 事假 公假 喪假 曠課 遲到 早退 退餐 看醫生 發燒 家裡有事 比賽…', size: 'xs', color: '#778899', wrap: true, margin: 'sm' }] }
+        },
+        {
+          type: 'bubble', size: 'mega',
+          header: { type: 'box', layout: 'vertical', backgroundColor: '#f5eeff', paddingAll: '12px', contents: [{ type: 'text', text: '🧭 輔導記錄 指令說明', weight: 'bold', size: 'lg', color: '#4a1a7a' }] },
+          body: {
+            type: 'box', layout: 'vertical', spacing: 'none', paddingAll: '0px',
+            contents: [
+              { type: 'box', layout: 'horizontal', backgroundColor: '#d4c0ec', paddingAll: '6px', contents: [{ type: 'text', text: '指令', size: 'xs', weight: 'bold', flex: 5, color: '#4a1a7a' }, { type: 'text', text: '效果', size: 'xs', weight: 'bold', flex: 7, color: '#4a1a7a' }] },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#faf7ff', contents: [{ type: 'text', text: '輔導：7號宋珏 上課說話', size: 'sm', weight: 'bold', flex: 5, color: '#5a2a8a', wrap: true }, { type: 'text', text: '建立草稿＋AI 產生輔導建議', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#d0c0e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', contents: [{ type: 'text', text: '輔導：5號 與8號衝突', size: 'sm', weight: 'bold', flex: 5, color: '#5a2a8a', wrap: true }, { type: 'text', text: '第二位學生自動設為相關人員', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#d0c0e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#faf7ff', contents: [{ type: 'text', text: '輔導：3號 第2節 情緒失控', size: 'sm', weight: 'bold', flex: 5, color: '#5a2a8a', wrap: true }, { type: 'text', text: '支援節次（第X節 / 晨光）', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#d0c0e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', contents: [{ type: 'text', text: '確認輔導\n送出輔導', size: 'sm', weight: 'bold', flex: 5, color: '#5a2a8a', wrap: true }, { type: 'text', text: '草稿確認後寫入輔導紀錄', size: 'sm', flex: 7, wrap: true, color: '#444' }] },
+              { type: 'separator', color: '#d0c0e8' },
+              { type: 'box', layout: 'horizontal', paddingAll: '7px', backgroundColor: '#faf7ff', contents: [{ type: 'text', text: '取消輔導', size: 'sm', weight: 'bold', flex: 5, color: '#5a2a8a', wrap: true }, { type: 'text', text: '放棄草稿，不寫入', size: 'sm', flex: 7, wrap: true, color: '#444' }] }
+            ]
+          },
+          footer: { type: 'box', layout: 'vertical', backgroundColor: '#f7f0ff', paddingAll: '8px', contents: [{ type: 'text', text: '必須以「輔導：」開頭才會觸發｜草稿有效期 30 分鐘', size: 'xs', color: '#6633aa', wrap: true }] }
+        }
+      ]
     }
   };
 }
