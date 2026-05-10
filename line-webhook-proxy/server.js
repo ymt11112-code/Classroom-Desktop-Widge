@@ -1607,25 +1607,20 @@ async function addTodoItemToGas(task, dueDate) {
 }
 
 async function saveTodoReviewRecordToGas(review) {
-  const payload = JSON.stringify(review);
-  const chunkSize = 12000;
+  const payload = Buffer.from(JSON.stringify(review), 'utf8').toString('base64url');
+  const chunkSize = 1500;
   const totalChunks = Math.max(1, Math.ceil(payload.length / chunkSize));
   let response = { ok: true };
 
   for (let i = 0; i < totalChunks; i++) {
     const gasUrl = new URL(GAS_BASE_URL);
     gasUrl.searchParams.set('action', 'saveTodoReviewRecordChunk');
-    const body = new URLSearchParams();
-    body.set('action', 'saveTodoReviewRecordChunk');
-    body.set('reviewId', review.id);
-    body.set('chunkIndex', String(i));
-    body.set('totalChunks', String(totalChunks));
-    body.set('chunk', payload.slice(i * chunkSize, (i + 1) * chunkSize));
-    response = await requestJson(gasUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
-      body: body.toString()
-    });
+    gasUrl.searchParams.set('reviewId', review.id);
+    gasUrl.searchParams.set('chunkIndex', String(i));
+    gasUrl.searchParams.set('totalChunks', String(totalChunks));
+    gasUrl.searchParams.set('chunkEncoding', 'base64url');
+    gasUrl.searchParams.set('chunk', payload.slice(i * chunkSize, (i + 1) * chunkSize));
+    response = await requestJson(gasUrl, { method: 'GET' });
     if (!response.ok) throw new Error(response.error || '儲存待辦審核紀錄失敗');
   }
 
