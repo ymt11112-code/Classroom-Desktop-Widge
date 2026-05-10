@@ -124,6 +124,26 @@ async function processWebhookPayload(payload) {
         continue;
       }
 
+      const checkTodoNos = parseCheckTodoCommand(text);
+      if (checkTodoNos !== null) {
+        const items = await checkTodoItemsInGas(checkTodoNos);
+        await respondToLineEvent(replyToken, userId, buildTodoFlexMessage(items));
+        continue;
+      }
+
+      if (isClearCompletedTodoCommand(text)) {
+        const items = await clearCompletedTodosFromGas();
+        await respondToLineEvent(replyToken, userId, buildTodoFlexMessage(items));
+        continue;
+      }
+
+      const deleteTodoNos = parseDeleteTodoCommand(text);
+      if (deleteTodoNos !== null) {
+        const items = await deleteTodoItemsFromGas(deleteTodoNos);
+        await respondToLineEvent(replyToken, userId, buildTodoFlexMessage(items));
+        continue;
+      }
+
       const dateStr = parseQueryDate(text);
       if (dateStr) {
         const digest = await fetchLineDigest(dateStr);
@@ -841,26 +861,160 @@ function isTodoListCommand(text) {
   return value === '待辦' || value === '待辦事項';
 }
 
+function parseTodoNumberList(str) {
+  const nums = String(str || '').split(/[,，\s]+/)
+    .map((s) => parseInt(s.trim(), 10))
+    .filter((n) => !isNaN(n) && n > 0);
+  return nums.length ? nums : null;
+}
+
+function parseCheckTodoCommand(text) {
+  const value = String(text || '').trim();
+
+  // "完成待辦 1,3,4" / "勾選待辦 1 3 4"
+  let m = value.match(/^(?:完成待辦|勾選待辦|勾待辦)\s+([\d,，\s]+)$/);
+  if (m) return parseTodoNumberList(m[1]);
+
+  // "完成 1,3,4" / "完成 134"（有空格：按逗號/空格分隔）
+  m = value.match(/^(?:完成|勾選)\s+([\d,，\s]+)$/);
+  if (m) return parseTodoNumberList(m[1]);
+
+  // "完成1,3,4"（無空格有逗號）或 "完成134"（無空格無逗號：逐位數）
+  m = value.match(/^(?:完成|勾選)([\d,，]+)$/);
+  if (m) {
+    const part = m[1];
+    if (part.includes(',') || part.includes('，')) return parseTodoNumberList(part);
+    const digits = part.split('').map(Number).filter((n) => n > 0);
+    return digits.length ? digits : null;
+  }
+
+  return null;
+}
+
+function isClearCompletedTodoCommand(text) {
+  const value = String(text || '').trim();
+  return value === '清除已完成' || value === '清空已完成' || value === '清除完成';
+}
+
+function parseDeleteTodoCommand(text) {
+  const value = String(text || '').trim();
+
+  // "刪除待辦 2,3" / "移除待辦 2 3"
+  let m = value.match(/^(?:刪除待辦|移除待辦)\s+([\d,，\s]+)$/);
+  if (m) return parseTodoNumberList(m[1]);
+
+  // "刪除 2,3" / "刪除2,3" / "刪除23"（無逗號=單一編號）
+  m = value.match(/^(?:刪除|移除)\s*([\d,，\s]+)$/);
+  if (m && m[1].trim()) return parseTodoNumberList(m[1]);
+
+  return null;
+}
+
+async function checkTodoItemsInGas(itemNos) {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'checkTodoItem');
+  gasUrl.searchParams.set('itemNos', itemNos.join(','));
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '勾選待辦事項失敗');
+  return Array.isArray(response.items) ? response.items : [];
+}
+
+async function clearCompletedTodosFromGas() {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'clearCompletedTodos');
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '清除已完成待辦失敗');
+  return Array.isArray(response.items) ? response.items : [];
+}
+
+async function deleteTodoItemsFromGas(itemNos) {
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'deleteTodoItem');
+  gasUrl.searchParams.set('itemNos', itemNos.join(','));
+  const response = await requestJson(gasUrl, { method: 'GET' });
+  if (!response.ok) throw new Error(response.error || '刪除待辦事項失敗');
+  return Array.isArray(response.items) ? response.items : [];
+}
+
 function parseAddTodoCommand(text) {
   const value = String(text || '').trim();
   const match = value.match(/^(?:\+待辦|新增待辦)\s+(.+)$/);
   if (!match) return null;
+  return extractTrailingDate(match[1].trim());
+}
 
-  const rest = match[1].trim();
-  const datePattern = /(?:截止\s*)?(\d{4}-\d{2}-\d{2}|\d{1,2}[\/月]\d{1,2}日?)$/;
-  const dateMatch = rest.match(datePattern);
+function extractTrailingDate(text) {
+  const CN_MONTH = '(?:十[一二]?|[一二三四五六七八九])';
+  const CN_DAY = '(?:三十一?|二十[一二三四五六七八九]?|十[一二三四五六七八九]?|[一二三四五六七八九十])';
+  const DATE_PAT =
+    '(?:\\d{4}[-\\/]\\d{1,2}[-\\/]\\d{1,2}' +
+    '|\\d{1,2}[\\/\\-]\\d{1,2}' +
+    '|\\d{1,2}月(?:' + CN_DAY + '|\\d{1,2})日?' +
+    '|' + CN_MONTH + '月(?:' + CN_DAY + '|\\d{1,2})日?)';
+  const KW = '(?:截止日期|日期|截止)';
+  const SEP = '[，,、\\s]';
+  const suffixRe = new RegExp(
+    '(?:' + SEP + '+' + KW + '?' + SEP + '*|' + KW + SEP + '*)(' + DATE_PAT + ')$'
+  );
 
-  let task = rest;
-  let dueDate = '';
-  if (dateMatch) {
-    const candidate = rest.slice(0, rest.length - dateMatch[0].length).trim();
-    if (candidate) {
-      task = candidate;
-      dueDate = dateMatch[1].replace(/月/, '/').replace(/日$/, '');
+  const m = text.match(suffixRe);
+  if (m) {
+    const parsed = parseDateString(m[1]);
+    if (parsed) {
+      const task = text.slice(0, m.index).replace(/[，,、\s]+$/, '').trim();
+      if (task) return { task, dueDate: parsed };
     }
   }
+  return { task: text, dueDate: '' };
+}
 
-  return { task, dueDate };
+function parseDateString(s) {
+  const str = String(s || '').trim().replace(/日$/, '');
+  if (!str) return null;
+
+  const isoM = str.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  if (isoM) return `${Number(isoM[2])}/${Number(isoM[3])}`;
+
+  const mdM = str.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+  if (mdM) return `${Number(mdM[1])}/${Number(mdM[2])}`;
+
+  const aMonthM = str.match(/^(\d{1,2})月(.+)$/);
+  if (aMonthM) {
+    const d = chineseOrArabicToNum(aMonthM[2]);
+    if (d) return `${Number(aMonthM[1])}/${d}`;
+  }
+
+  const cMonthM = str.match(/^(十[一二]?|[一二三四五六七八九十])月(.+)$/);
+  if (cMonthM) {
+    const mo = chineseMonthNum(cMonthM[1]);
+    const d = chineseOrArabicToNum(cMonthM[2]);
+    if (mo && d) return `${mo}/${d}`;
+  }
+
+  return null;
+}
+
+function chineseOrArabicToNum(s) {
+  const str = String(s || '').trim().replace(/日$/, '');
+  if (!str) return null;
+  if (/^\d+$/.test(str)) return parseInt(str, 10);
+  const singles = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+  if (str === '十') return 10;
+  const t1 = str.match(/^十([一二三四五六七八九]?)$/);
+  if (t1) return 10 + (singles[t1[1]] || 0);
+  const t2 = str.match(/^二十([一二三四五六七八九]?)$/);
+  if (t2) return 20 + (singles[t2[1]] || 0);
+  const t3 = str.match(/^三十([一]?)$/);
+  if (t3) return 30 + (t3[1] ? 1 : 0);
+  return singles[str] || null;
+}
+
+function chineseMonthNum(s) {
+  const str = String(s || '').trim();
+  if (str === '十一') return 11;
+  if (str === '十二') return 12;
+  const map = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+  return map[str] || null;
 }
 
 async function fetchTodoItemsFromGas() {
@@ -913,6 +1067,7 @@ function buildTodoFlexMessage(items) {
     quickReply: {
       items: [
         { type: 'action', action: { type: 'message', label: '待辦清單', text: '待辦' } },
+        { type: 'action', action: { type: 'message', label: '清除已完成', text: '清除已完成' } },
         { type: 'action', action: { type: 'message', label: '今天進度', text: '今天' } }
       ]
     },
@@ -934,7 +1089,7 @@ function buildTodoFlexMessage(items) {
       footer: {
         type: 'box', layout: 'vertical', paddingAll: '10px',
         backgroundColor: '#f0f7f0',
-        contents: [{ type: 'text', text: '輸入「+待辦 事項」新增　可加截止日期如「+待辦 訂便當 5/20」', size: 'sm', color: '#558855', align: 'center', wrap: true }]
+        contents: [{ type: 'text', text: '新增：+待辦 事項 5/20　勾選：完成待辦 1　刪除：刪除待辦 1', size: 'sm', color: '#558855', align: 'center', wrap: true }]
       }
     }
   };
