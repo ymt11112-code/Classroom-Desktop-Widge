@@ -626,6 +626,19 @@ function formatMdDate(dateObj) {
   return `${dateObj.getMonth() + 1}/${dateObj.getDate()}`;
 }
 
+function formatTodoDueDateForLine(value) {
+  if (value instanceof Date) return formatMdDate(value);
+
+  const text = String(value || '').trim();
+  const isoMatch = text.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  if (isoMatch) return `${Number(isoMatch[2])}/${Number(isoMatch[3])}`;
+
+  const mdMatch = text.match(/^(\d{1,2})[-\/](\d{1,2})$/);
+  if (mdMatch) return `${Number(mdMatch[1])}/${Number(mdMatch[2])}`;
+
+  return text;
+}
+
 function toIsoFromParts(year, month, day) {
   return [String(year), String(month).padStart(2, '0'), String(day).padStart(2, '0')].join('-');
 }
@@ -1064,7 +1077,7 @@ function buildTodoFlexMessage(items) {
         { type: 'text', text: `${mark} ${label}`, size: 'lg', flex: 5, wrap: true, color: textColor }
       ];
       if (item.dueDate) {
-        rowContents.push({ type: 'text', text: String(item.dueDate), size: 'sm', flex: 2, align: 'end', color: '#888888', gravity: 'center' });
+        rowContents.push({ type: 'text', text: formatTodoDueDateForLine(item.dueDate), size: 'sm', flex: 2, align: 'end', color: '#888888', gravity: 'center' });
       }
       rows.push({ type: 'box', layout: 'horizontal', paddingAll: '8px', backgroundColor: bg, contents: rowContents });
       rows.push({ type: 'separator', color: '#e0e8e0' });
