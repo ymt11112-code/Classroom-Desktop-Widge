@@ -1608,7 +1608,9 @@ async function addTodoItemToGas(task, dueDate) {
 
 async function saveTodoReviewRecordToGas(review) {
   const payload = JSON.stringify(review);
-  const chunkSize = 5000;
+  // GAS Web App GET requests can fail before Apps Script runs if the encoded URL is too long.
+  // Keep each chunk intentionally small because CJK text expands after URL encoding.
+  const chunkSize = 900;
   const totalChunks = Math.max(1, Math.ceil(payload.length / chunkSize));
   let response = { ok: true };
 
@@ -1974,6 +1976,7 @@ function requestJson(targetUrl, options, redirectCount) {
   return new Promise((resolve, reject) => {
     const currentRedirectCount = Number(redirectCount || 0);
     const url = typeof targetUrl === 'string' ? new URL(targetUrl) : targetUrl;
+    const targetDescription = describeRequestTarget(url);
     const requestOptions = Object.assign({}, options || {});
     const client = url.protocol === 'https:' ? https : http;
 
@@ -1986,7 +1989,7 @@ function requestJson(targetUrl, options, redirectCount) {
 
         if ([301, 302, 303, 307, 308].includes(statusCode) && response.headers.location) {
           if (currentRedirectCount >= 5) {
-            return reject(new Error(`HTTP ${statusCode}: too many redirects`));
+            return reject(new Error(`HTTP ${statusCode} ${targetDescription}: too many redirects`));
           }
           const nextUrl = new URL(response.headers.location, url);
           const nextOptions = Object.assign({}, requestOptions);
@@ -2005,7 +2008,7 @@ function requestJson(targetUrl, options, redirectCount) {
 
         if (!raw) {
           if (statusCode >= 200 && statusCode < 300) return resolve({ ok: true });
-          return reject(new Error(`HTTP ${statusCode}`));
+          return reject(new Error(`HTTP ${statusCode} ${targetDescription}`));
         }
 
         let parsed;
@@ -2014,11 +2017,11 @@ function requestJson(targetUrl, options, redirectCount) {
         } catch (_error) {
           if (statusCode >= 200 && statusCode < 300) return resolve({ ok: true, raw });
           const compactRaw = raw.replace(/\s+/g, ' ').replace(/<[^>]+>/g, ' ').trim().slice(0, 180);
-          return reject(new Error(`HTTP ${statusCode}: ${compactRaw || 'Non-JSON response'}`));
+          return reject(new Error(`HTTP ${statusCode} ${targetDescription}: ${compactRaw || 'Non-JSON response'}`));
         }
 
         if (statusCode >= 200 && statusCode < 300) return resolve(parsed);
-        return reject(new Error(`HTTP ${statusCode}: ${formatHttpErrorBody(parsed, raw)}`));
+        return reject(new Error(`HTTP ${statusCode} ${targetDescription}: ${formatHttpErrorBody(parsed, raw)}`));
       });
     });
 
@@ -2026,6 +2029,15 @@ function requestJson(targetUrl, options, redirectCount) {
     if (requestOptions.body) request.write(requestOptions.body);
     request.end();
   });
+}
+
+function describeRequestTarget(url) {
+  const action = url.searchParams ? url.searchParams.get('action') : '';
+  const modelMatch = String(url.pathname || '').match(/\/models\/([^/:]+):/);
+  const detail = action
+    ? ` action=${action}`
+    : (modelMatch ? ` model=${decodeURIComponent(modelMatch[1])}` : '');
+  return `${url.hostname}${url.pathname}${detail}`;
 }
 
 function formatHttpErrorBody(parsed, raw) {
