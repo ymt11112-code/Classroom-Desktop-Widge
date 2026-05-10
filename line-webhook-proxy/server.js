@@ -179,6 +179,11 @@ async function processWebhookPayload(payload) {
         continue;
       }
 
+      if (hasPendingTodoReviewBatch(userId)) {
+        await queueTodoReviewText(replyToken, userId, text);
+        continue;
+      }
+
       const dateStr = parseQueryDate(text);
       if (dateStr) {
         const digest = await fetchLineDigest(dateStr);
@@ -1079,7 +1084,20 @@ function parseTodoCandidateTextCommand(text) {
     return body || null;
   }
   if (looksLikeLineReportTodoOpening(value)) return value;
+  if (looksLikeTodoBroadcastOpening(value)) return value;
   return null;
+}
+
+function looksLikeTodoBroadcastOpening(text) {
+  const firstLine = String(text || '').trim().split(/\r?\n/)[0].trim();
+  if (!firstLine) return false;
+  const compact = firstLine.replace(/\s+/g, '');
+  return /^@all(?:\b|[:：,，\s]|$)/i.test(firstLine) || /^@all/i.test(compact) || /^\u8acb\u5b78\u4e3b\u8f49\u50b3/.test(compact);
+}
+
+function hasPendingTodoReviewBatch(userId) {
+  const batch = pendingTodoSourceBatches.get(userId);
+  return !!(batch && Array.isArray(batch.sources) && batch.sources.length);
 }
 
 function looksLikeLineReportTodoOpening(text) {
@@ -1167,6 +1185,7 @@ async function finalizeTodoReviewBatch(userId) {
     sourceType: batch.sources.some((source) => source.sourceType === 'PDF') ? 'MIXED' : 'LINE',
     sourceLabel: buildTodoBatchSourceLabel(batch.sources),
     sourceText: buildTodoBatchSourceText(batch.sources),
+    reportDate: extractTodoReportDateFromSources(batch.sources),
     pdfBuffers: batch.sources.map((source) => source.pdfBuffer).filter(Boolean),
     lineUserId: userId
   });
@@ -1189,6 +1208,30 @@ function buildTodoBatchSourceText(sources) {
   }).join('\n\n');
 }
 
+function extractTodoReportDateFromSources(sources) {
+  for (const source of sources || []) {
+    const dateText = extractTodoReportDateText([
+      source && source.sourceLabel,
+      source && source.sourceText
+    ].filter(Boolean).join('\n'));
+    if (dateText) return dateText;
+  }
+  return '';
+}
+
+function extractTodoReportDateText(text) {
+  const value = String(text || '').trim();
+  if (!value) return '';
+
+  let match = value.match(/(?:^|[^\d])(\d{3})[./-]?(\d{1,2})[./-]?(\d{1,2})(?:[^\d]|$)/);
+  if (match) return `${Number(match[1])}/${Number(match[2])}/${Number(match[3])}`;
+
+  match = value.match(/(?:^|[^\d])(\d{1,2})[./-](\d{1,2})(?:[^\d]|$)/);
+  if (match) return `${Number(match[1])}/${Number(match[2])}`;
+
+  return '';
+}
+
 async function createTodoReview(input) {
   cleanupExpiredDrafts();
   const candidates = await callGeminiForTodoCandidates(input);
@@ -1201,6 +1244,7 @@ async function createTodoReview(input) {
     sourceType: input.sourceType,
     sourceLabel: input.sourceLabel,
     sourceText: input.sourceText,
+    reportDate: input.reportDate || '',
     lineUserId: input.lineUserId,
     candidates,
     reviewUrl: buildReviewUrl(id)
@@ -1345,6 +1389,14 @@ function normalizeTodoDueDate(value) {
   return '';
 }
 
+function buildTodoReviewReportDateContents(review) {
+  const reportDate = String(review && review.reportDate || '').trim();
+  if (!reportDate) return [];
+  return [
+    { type: 'text', text: '\u6668\u6703\u5831\u544a\u65e5\u671f\uff1a' + reportDate, size: 'sm', color: '#365b42', wrap: true }
+  ];
+}
+
 function buildTodoReviewLinkFlexMessage(review) {
   return {
     type: 'flex',
@@ -1365,6 +1417,7 @@ function buildTodoReviewLinkFlexMessage(review) {
         spacing: 'sm',
         contents: [
           { type: 'text', text: `已整理 ${review.candidates.length} 個候選項目`, size: 'md', color: '#365b42', wrap: true },
+          ...buildTodoReviewReportDateContents(review),
           { type: 'text', text: '請打開審核頁勾選要寫入 Google Sheet 的待辦事項。', size: 'sm', color: '#6b7f70', wrap: true }
         ]
       },
