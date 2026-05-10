@@ -13,20 +13,27 @@ const LINE_CHANNEL_ACCESS_TOKEN = String(process.env.LINE_CHANNEL_ACCESS_TOKEN |
 const LINE_DEFAULT_USER_ID = String(process.env.LINE_DEFAULT_USER_ID || '').trim();
 const GAS_BASE_URL = String(process.env.GAS_BASE_URL || '').trim();
 const APP_TIMEZONE = String(process.env.APP_TIMEZONE || 'Asia/Taipei').trim();
+const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
+const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+const REVIEW_BASE_URL = String(process.env.REVIEW_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
 
 const LINE_HOMEROOM = ['國語', '數學', '社會', '健康', '樂活'];
 const LINE_SUBJECT = ['自然', '藝專', '閩語', '視覺', '英語', '分部課', '樂理'];
 const LEAVE_TYPES = ['事假', '病假', '公假', '喪假', '曠課'];
 const PENDING_DRAFT_TTL_MS = 30 * 60 * 1000;
 const STUDENT_CACHE_TTL_MS = 5 * 60 * 1000;
+const TODO_REVIEW_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_INLINE_PDF_BYTES = 18 * 1024 * 1024;
 
 const pendingAbsenceDrafts = new Map();
 const pendingCounselingDrafts = new Map();
+const pendingTodoReviews = new Map();
 const studentCache = { expiresAt: 0, students: [] };
 
 if (!LINE_CHANNEL_SECRET) console.warn('Missing LINE_CHANNEL_SECRET');
 if (!LINE_CHANNEL_ACCESS_TOKEN) console.warn('Missing LINE_CHANNEL_ACCESS_TOKEN');
 if (!GAS_BASE_URL) console.warn('Missing GAS_BASE_URL');
+if (!GEMINI_API_KEY) console.warn('Missing GEMINI_API_KEY');
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -38,6 +45,14 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && url.pathname === '/health') {
       return sendJson(res, 200, { ok: true, service: 'line-webhook-proxy' });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/todo-review') {
+      return serveTodoReviewPage(req, res, url);
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/todo-review/commit') {
+      return commitTodoReview(req, res, url);
     }
 
     if (req.method === 'POST' && url.pathname === '/webhook') {
@@ -80,17 +95,24 @@ async function processWebhookPayload(payload) {
   cleanupExpiredDrafts();
 
   for (const event of events) {
-    if (!event || event.type !== 'message' || !event.message || event.message.type !== 'text') {
+    if (!event || event.type !== 'message' || !event.message) {
       continue;
     }
-
-    const text = String(event.message.text || '').trim();
-    if (!text) continue;
 
     const replyToken = event.replyToken ? String(event.replyToken).trim() : '';
     const userId = event.source && event.source.userId ? String(event.source.userId).trim() : LINE_DEFAULT_USER_ID;
 
     try {
+      if (event.message.type === 'file') {
+        await prepareTodoReviewFromLineFile(replyToken, userId, event.message);
+        continue;
+      }
+
+      if (event.message.type !== 'text') continue;
+
+      const text = String(event.message.text || '').trim();
+      if (!text) continue;
+
       if (isConfirmAbsenceCommand(text)) {
         await confirmPendingAbsence(replyToken, userId);
         continue;
@@ -113,6 +135,12 @@ async function processWebhookPayload(payload) {
 
       if (isHelpCommand(text)) {
         await respondToLineEvent(replyToken, userId, buildCommandHelpFlexMessage());
+        continue;
+      }
+
+      const todoAiText = parseTodoCandidateTextCommand(text);
+      if (todoAiText) {
+        await prepareTodoReviewFromText(replyToken, userId, todoAiText);
         continue;
       }
 
@@ -179,13 +207,14 @@ async function processWebhookPayload(payload) {
 
 function cleanupExpiredDrafts() {
   const now = Date.now();
-  cleanupExpiredDraftMap(pendingAbsenceDrafts, now);
-  cleanupExpiredDraftMap(pendingCounselingDrafts, now);
+  cleanupExpiredDraftMap(pendingAbsenceDrafts, now, PENDING_DRAFT_TTL_MS);
+  cleanupExpiredDraftMap(pendingCounselingDrafts, now, PENDING_DRAFT_TTL_MS);
+  cleanupExpiredDraftMap(pendingTodoReviews, now, TODO_REVIEW_TTL_MS);
 }
 
-function cleanupExpiredDraftMap(map, now) {
+function cleanupExpiredDraftMap(map, now, ttlMs) {
   for (const [userId, draft] of map.entries()) {
-    if (!draft || !draft.createdAt || now - draft.createdAt > PENDING_DRAFT_TTL_MS) {
+    if (!draft || !draft.createdAt || now - draft.createdAt > ttlMs) {
       map.delete(userId);
     }
   }
@@ -1040,6 +1069,431 @@ function chineseMonthNum(s) {
   return map[str] || null;
 }
 
+function parseTodoCandidateTextCommand(text) {
+  const value = String(text || '').trim();
+  const match = value.match(/^(?:整理待辦|AI待辦|ai待辦|待辦整理|待辦候選)\s*[:：]?\s*([\s\S]+)$/);
+  if (match) {
+    const body = String(match[1] || '').trim();
+    return body || null;
+  }
+  if (looksLikeLineReportTodoOpening(value)) return value;
+  return null;
+}
+
+function looksLikeLineReportTodoOpening(text) {
+  const firstLine = String(text || '').trim().split(/\r?\n/)[0].trim();
+  if (!firstLine) return false;
+
+  const compact = firstLine.replace(/\s+/g, '');
+  if (/^【[^】]{1,20}】報告(?:\(#?\d+\))?\d{6,8}/.test(compact)) return true;
+
+  const rocDate = String.raw`\d{3}(?:[./-]?\d{1,2}[./-]?\d{1,2})`;
+  const weekday = String.raw`(?:[（(][一二三四五六日天][）)])?`;
+  const reportUnitOrMarker = String.raw`(?:報告|晨會|轉知|輔導組|研發組|學務處|訓育組|國際組|教務處|總務處|人事室|會計室|主任|組|處|室|#\d+|\(#?\d+\))`;
+  return new RegExp(`^${rocDate}${weekday}.{0,40}${reportUnitOrMarker}`).test(compact);
+}
+
+async function prepareTodoReviewFromText(replyToken, userId, text) {
+  if (!userId) throw new Error('缺少 LINE userId，無法建立審核頁');
+  await respondToLineEvent(replyToken, userId, { type: 'text', text: '收到，我正在整理待辦候選清單...' });
+  const review = await createTodoReview({
+    sourceType: 'LINE',
+    sourceLabel: 'LINE 訊息',
+    sourceText: text,
+    lineUserId: userId
+  });
+  await pushLineMessage(userId, buildTodoReviewLinkFlexMessage(review));
+}
+
+async function prepareTodoReviewFromLineFile(replyToken, userId, message) {
+  const fileName = String((message && message.fileName) || '').trim();
+  const messageId = String((message && message.id) || '').trim();
+  if (!messageId) throw new Error('LINE 檔案缺少 message id');
+  if (!/\.pdf$/i.test(fileName)) {
+    await respondToLineEvent(replyToken, userId, { type: 'text', text: '目前只會自動整理 PDF 檔案。' });
+    return;
+  }
+  if (!userId) throw new Error('缺少 LINE userId，無法建立審核頁');
+
+  await respondToLineEvent(replyToken, userId, { type: 'text', text: '收到 PDF，我正在請 Gemini 整理待辦候選清單...' });
+  const pdfBuffer = await downloadLineMessageContent(messageId);
+  if (pdfBuffer.length > MAX_INLINE_PDF_BYTES) {
+    throw new Error('PDF 超過 18MB，請先壓縮或拆成較小檔案再傳。');
+  }
+
+  const review = await createTodoReview({
+    sourceType: 'PDF',
+    sourceLabel: fileName || 'LINE PDF',
+    sourceText: fileName ? `檔名：${fileName}` : 'LINE PDF',
+    pdfBuffer,
+    lineUserId: userId
+  });
+  await pushLineMessage(userId, buildTodoReviewLinkFlexMessage(review));
+}
+
+async function createTodoReview(input) {
+  cleanupExpiredDrafts();
+  const candidates = await callGeminiForTodoCandidates(input);
+  if (!candidates.length) throw new Error('Gemini 沒有整理出待辦候選項目');
+
+  const id = crypto.randomBytes(16).toString('hex');
+  const review = {
+    id,
+    createdAt: Date.now(),
+    sourceType: input.sourceType,
+    sourceLabel: input.sourceLabel,
+    sourceText: input.sourceText,
+    lineUserId: input.lineUserId,
+    candidates,
+    reviewUrl: buildReviewUrl(id)
+  };
+  pendingTodoReviews.set(id, review);
+  return review;
+}
+
+function buildReviewUrl(id) {
+  if (!REVIEW_BASE_URL) {
+    throw new Error('請在 Render 環境變數設定 REVIEW_BASE_URL，例如 https://你的服務.onrender.com');
+  }
+  return `${REVIEW_BASE_URL}/todo-review?id=${encodeURIComponent(id)}`;
+}
+
+async function downloadLineMessageContent(messageId) {
+  return requestBuffer(`https://api-data.line.me/v2/bot/message/${encodeURIComponent(messageId)}/content`, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}` }
+  });
+}
+
+async function callGeminiForTodoCandidates(input) {
+  if (!GEMINI_API_KEY) throw new Error('請在 Render 環境變數設定 GEMINI_API_KEY');
+
+  const parts = [];
+  if (input.pdfBuffer) {
+    parts.push({
+      inline_data: {
+        mime_type: 'application/pdf',
+        data: input.pdfBuffer.toString('base64')
+      }
+    });
+  }
+  parts.push({ text: buildTodoGeminiPrompt(input) });
+
+  const geminiUrl = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`);
+  geminiUrl.searchParams.set('key', GEMINI_API_KEY);
+
+  const response = await requestJson(geminiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        temperature: 0.2,
+        response_mime_type: 'application/json'
+      }
+    })
+  });
+
+  if (response.error) throw new Error(response.error.message || 'Gemini returned an error');
+  const text = extractGeminiText(response);
+  const parsed = parseGeminiJson(text);
+  const rawItems = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.items) ? parsed.items : []);
+  return normalizeTodoCandidates(rawItems, input);
+}
+
+function buildTodoGeminiPrompt(input) {
+  const sourceType = input.sourceType === 'PDF' ? 'PDF' : 'LINE';
+  const sourceText = String(input.sourceText || '').trim();
+  return [
+    '你是台灣國小導師的行政待辦整理助手。請從來源內容整理出需要老師後續處理的待辦候選清單。',
+    '',
+    '請嚴格回傳 JSON，格式如下：',
+    '{"items":[{"title":"事件及日期時間清楚的標題","subtitle":"補充說明，可包含表單或連結摘要","dueDate":"YYYY-MM-DD 或空字串","details":"來源詳情完整整理","sourceType":"PDF 或 LINE","sourceText":"原始來源文字；若來源為 LINE，一定要放完整訊息","teacherMessage":"給導師看的說明","parentMessage":"若需要轉傳家長群組，提供可直接轉傳文字，否則空字串","links":[{"label":"表單或連結名稱","url":"https://..."}]}]}',
+    '',
+    '規則：',
+    '1. 標題要明確，列出清楚的事件及日期時間。',
+    '2. subtitle 放標題下方小字，列出補充說明；若有表單或連結，links 必須抽出可點選 URL。',
+    '3. details 要完整列出與標題相關的來源詳情，並標示來源是 PDF 還是 LINE。',
+    '4. 若來源為 LINE，sourceText 必須是完整 LINE 訊息，不可摘要。',
+    '5. 若內容需要傳達到家長群組，parentMessage 要寫可直接轉傳到家長群組的版本；teacherMessage 寫給導師自己看的版本。',
+    '6. 只保留需要行動或追蹤的事項；不要加入寒暄或不存在的資訊。',
+    '7. LINE 訊息開頭常是民國日期、處室/組別與報告編號，例如「1150506學務處轉知」或「115.5.6(三)國際組(#713)晨會報告」，請優先把這些資訊整理進標題或 subtitle。',
+    '',
+    `來源類型：${sourceType}`,
+    sourceText ? `來源文字：\n${sourceText}` : ''
+  ].join('\n');
+}
+
+function extractGeminiText(response) {
+  const candidates = Array.isArray(response && response.candidates) ? response.candidates : [];
+  const parts = candidates[0] && candidates[0].content && Array.isArray(candidates[0].content.parts)
+    ? candidates[0].content.parts
+    : [];
+  const text = parts.map((part) => String((part && part.text) || '')).join('').trim();
+  if (!text) throw new Error('Gemini 沒有回傳文字內容');
+  return text;
+}
+
+function parseGeminiJson(text) {
+  const raw = String(text || '').trim();
+  try {
+    return JSON.parse(raw);
+  } catch (_error) {
+    const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/) || raw.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (match) return JSON.parse(match[1]);
+    throw new Error('Gemini 回傳格式不是可解析的 JSON');
+  }
+}
+
+function normalizeTodoCandidates(items, input) {
+  return (items || []).map((item, index) => {
+    const title = String(item && item.title || '').trim();
+    if (!title) return null;
+    const links = Array.isArray(item.links) ? item.links : [];
+    return {
+      id: `item-${index + 1}`,
+      title,
+      subtitle: String(item.subtitle || '').trim(),
+      dueDate: normalizeTodoDueDate(item.dueDate),
+      details: String(item.details || '').trim(),
+      sourceType: String(item.sourceType || input.sourceType || '').trim(),
+      sourceText: String(item.sourceText || input.sourceText || '').trim(),
+      teacherMessage: String(item.teacherMessage || '').trim(),
+      parentMessage: String(item.parentMessage || '').trim(),
+      links: links.map((link) => ({
+        label: String(link && (link.label || link.url) || '').trim(),
+        url: String(link && link.url || '').trim()
+      })).filter((link) => /^https?:\/\//i.test(link.url))
+    };
+  }).filter(Boolean).slice(0, 20);
+}
+
+function normalizeTodoDueDate(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const isoMatch = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (isoMatch) return `${isoMatch[1]}-${String(Number(isoMatch[2])).padStart(2, '0')}-${String(Number(isoMatch[3])).padStart(2, '0')}`;
+  const mdMatch = text.match(/^(\d{1,2})[/-](\d{1,2})$/);
+  if (mdMatch) {
+    const today = getTodayInTimeZone();
+    return `${today.getFullYear()}-${String(Number(mdMatch[1])).padStart(2, '0')}-${String(Number(mdMatch[2])).padStart(2, '0')}`;
+  }
+  return '';
+}
+
+function buildTodoReviewLinkFlexMessage(review) {
+  return {
+    type: 'flex',
+    altText: '待辦候選清單已建立',
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+      header: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#dff3df',
+        paddingAll: '14px',
+        contents: [{ type: 'text', text: '待辦候選清單', weight: 'bold', size: 'xl', color: '#145c2e' }]
+      },
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          { type: 'text', text: `已整理 ${review.candidates.length} 個候選項目`, size: 'md', color: '#365b42', wrap: true },
+          { type: 'text', text: '請打開審核頁勾選要寫入 Google Sheet 的待辦事項。', size: 'sm', color: '#6b7f70', wrap: true }
+        ]
+      },
+      footer: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'sm',
+        contents: [
+          { type: 'button', style: 'primary', color: '#1f8f4d', action: { type: 'uri', label: '開啟審核頁', uri: review.reviewUrl } }
+        ]
+      }
+    }
+  };
+}
+
+async function serveTodoReviewPage(_req, res, url) {
+  cleanupExpiredDrafts();
+  const id = String(url.searchParams.get('id') || '').trim();
+  const review = pendingTodoReviews.get(id);
+  if (!review) {
+    return sendHtml(res, 404, buildTodoReviewMissingHtml());
+  }
+  return sendHtml(res, 200, buildTodoReviewHtml(review));
+}
+
+async function commitTodoReview(req, res, url) {
+  cleanupExpiredDrafts();
+  const idFromQuery = String(url.searchParams.get('id') || '').trim();
+  const raw = await readRawBody(req);
+  let payload = {};
+  try {
+    payload = raw ? JSON.parse(raw) : {};
+  } catch (_error) {
+    return sendJson(res, 400, { ok: false, error: 'Invalid JSON body' });
+  }
+
+  const id = String(payload.id || idFromQuery || '').trim();
+  const review = pendingTodoReviews.get(id);
+  if (!review) return sendJson(res, 404, { ok: false, error: '審核資料已過期或不存在' });
+
+  const selectedIds = Array.isArray(payload.selectedIds) ? payload.selectedIds.map(String) : [];
+  const selected = review.candidates.filter((item) => selectedIds.includes(item.id));
+  if (!selected.length) return sendJson(res, 400, { ok: false, error: '請至少勾選一個待辦事項' });
+
+  let latestItems = [];
+  for (const item of selected) {
+    latestItems = await addTodoItemToGas(item.title, item.dueDate);
+  }
+
+  pendingTodoReviews.delete(id);
+  if (review.lineUserId) {
+    pushLineMessage(review.lineUserId, {
+      type: 'text',
+      text: `已加入 ${selected.length} 個待辦事項到 Google Sheet。`
+    }).catch((error) => console.error('[todo review notify]', error && error.stack ? error.stack : error));
+  }
+  return sendJson(res, 200, { ok: true, count: selected.length, items: latestItems });
+}
+
+function buildTodoReviewMissingHtml() {
+  return '<!doctype html><meta charset="utf-8"><title>待辦審核</title><body style="font-family:system-ui;padding:24px"><h1>審核頁不存在或已過期</h1><p>請重新從 LINE 傳送 PDF 或用「整理待辦」建立候選清單。</p></body>';
+}
+
+function buildTodoReviewHtml(review) {
+  const payload = JSON.stringify({
+    id: review.id,
+    sourceLabel: review.sourceLabel,
+    sourceType: review.sourceType,
+    candidates: review.candidates
+  }).replace(/</g, '\\u003c');
+
+  return `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>待辦候選審核</title>
+  <style>
+    :root { color-scheme: light; --green:#1f8f4d; --green-dark:#145c2e; --mint:#e8f7e8; --line:#d7ead7; --text:#1f3328; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", sans-serif; background: #f4f8f3; color: var(--text); }
+    .app { max-width: 760px; margin: 0 auto; min-height: 100vh; background: #f9fcf8; }
+    header { position: sticky; top: 0; z-index: 3; padding: 16px; background: #dff3df; border-bottom: 1px solid var(--line); }
+    h1 { margin: 0; font-size: 22px; color: var(--green-dark); letter-spacing: 0; }
+    .meta { margin-top: 4px; color: #5c7464; font-size: 13px; }
+    main { padding: 14px; }
+    .card { margin-bottom: 12px; border: 1px solid var(--line); border-radius: 8px; background: white; overflow: hidden; box-shadow: 0 1px 2px rgba(20, 92, 46, .06); }
+    .card-top { display: grid; grid-template-columns: 34px 1fr; gap: 8px; padding: 12px; align-items: start; }
+    input[type="checkbox"] { width: 22px; height: 22px; accent-color: var(--green); margin-top: 2px; }
+    .title { font-size: 17px; font-weight: 700; color: #173d27; line-height: 1.35; }
+    .subtitle { margin-top: 4px; font-size: 13px; color: #637568; line-height: 1.45; white-space: pre-wrap; }
+    .due { display: inline-block; margin-top: 8px; padding: 3px 8px; border-radius: 999px; background: var(--mint); color: var(--green-dark); font-size: 12px; font-weight: 700; }
+    .links { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+    .links a, .line-btn { border: 1px solid #b7dbb9; color: var(--green-dark); background: #f3fbf3; border-radius: 999px; padding: 6px 10px; font-size: 13px; text-decoration: none; font-weight: 700; }
+    details { border-top: 1px solid #edf3ed; }
+    summary { cursor: pointer; list-style: none; padding: 10px 12px; color: var(--green-dark); font-size: 14px; font-weight: 700; }
+    summary::-webkit-details-marker { display: none; }
+    .detail { padding: 0 12px 12px; color: #3d4b41; font-size: 14px; line-height: 1.6; }
+    .block { margin-top: 10px; padding: 10px; background: #f6faf6; border: 1px solid #e2efe2; border-radius: 8px; white-space: pre-wrap; }
+    .source { color: #6d7f71; font-size: 12px; margin-bottom: 6px; font-weight: 700; }
+    .bar { position: sticky; bottom: 0; display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 12px 14px; background: rgba(249, 252, 248, .96); border-top: 1px solid var(--line); backdrop-filter: blur(8px); }
+    button { border: 0; border-radius: 8px; padding: 12px 14px; background: var(--green); color: white; font-weight: 800; font-size: 15px; }
+    button:disabled { opacity: .55; }
+    .count { align-self: center; color: #5c7464; font-size: 14px; }
+    .toast { min-height: 22px; padding: 0 14px 12px; color: var(--green-dark); font-weight: 700; }
+    @media (max-width: 520px) {
+      main { padding: 10px; }
+      .card-top { grid-template-columns: 30px 1fr; padding: 11px; }
+      .title { font-size: 16px; }
+      .bar { grid-template-columns: 1fr; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>待辦候選審核</h1>
+      <div class="meta" id="meta"></div>
+    </header>
+    <main id="list"></main>
+    <div class="bar">
+      <div class="count" id="count">已勾選 0 項</div>
+      <button id="submit">加入勾選項目</button>
+    </div>
+    <div class="toast" id="toast"></div>
+  </div>
+  <script>
+    const review = ${payload};
+    const list = document.getElementById('list');
+    const count = document.getElementById('count');
+    const submit = document.getElementById('submit');
+    const toast = document.getElementById('toast');
+    document.getElementById('meta').textContent = (review.sourceType || '') + ' - ' + (review.sourceLabel || '') + ' - ' + review.candidates.length + ' 個候選項目';
+
+    function esc(value) {
+      return String(value || '').replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
+    }
+    function linkify(text) {
+      return esc(text).replace(/(https?:\\/\\/[^\\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+    }
+    function updateCount() {
+      const n = document.querySelectorAll('input[type="checkbox"]:checked').length;
+      count.textContent = '已勾選 ' + n + ' 項';
+    }
+    function render() {
+      list.innerHTML = review.candidates.map(item => {
+        const links = (item.links || []).map(link => '<a href="' + esc(link.url) + '" target="_blank" rel="noopener">' + esc(link.label || '開啟連結') + '</a>').join('');
+        const parentLink = item.parentMessage ? '<a class="line-btn" href="line://msg/text/' + encodeURIComponent(item.parentMessage) + '">傳送到 LINE</a>' : '';
+        return '<article class="card">'
+          + '<div class="card-top"><input type="checkbox" data-id="' + esc(item.id) + '" checked><div>'
+          + '<div class="title">' + esc(item.title) + '</div>'
+          + (item.subtitle ? '<div class="subtitle">' + linkify(item.subtitle) + '</div>' : '')
+          + (item.dueDate ? '<span class="due">' + esc(item.dueDate) + '</span>' : '')
+          + ((links || parentLink) ? '<div class="links">' + links + parentLink + '</div>' : '')
+          + '</div></div>'
+          + '<details><summary>展開來源詳情</summary><div class="detail">'
+          + '<div class="source">來源：' + esc(item.sourceType || review.sourceType || '') + '</div>'
+          + (item.details ? '<div class="block">' + linkify(item.details) + '</div>' : '')
+          + (item.sourceText ? '<div class="block">' + linkify(item.sourceText) + '</div>' : '')
+          + (item.teacherMessage ? '<div class="block"><strong>給導師看</strong>\\n' + linkify(item.teacherMessage) + '</div>' : '')
+          + (item.parentMessage ? '<div class="block"><strong>轉傳家長群組</strong>\\n' + linkify(item.parentMessage) + '</div>' : '')
+          + '</div></details></article>';
+      }).join('');
+      document.querySelectorAll('input[type="checkbox"]').forEach(box => box.addEventListener('change', updateCount));
+      updateCount();
+    }
+    submit.addEventListener('click', async () => {
+      const selectedIds = Array.from(document.querySelectorAll('input[type="checkbox"]:checked')).map(box => box.dataset.id);
+      if (!selectedIds.length) { toast.textContent = '請先勾選至少一個項目。'; return; }
+      submit.disabled = true;
+      toast.textContent = '正在寫入 Google Sheet...';
+      try {
+        const resp = await fetch('/api/todo-review/commit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: review.id, selectedIds })
+        });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || '寫入失敗');
+        toast.textContent = '已加入 ' + data.count + ' 個待辦事項。';
+        submit.textContent = '已加入';
+      } catch (error) {
+        submit.disabled = false;
+        toast.textContent = error.message || String(error);
+      }
+    });
+    render();
+  </script>
+</body>
+</html>`;
+}
+
 async function fetchTodoItemsFromGas() {
   const gasUrl = new URL(GAS_BASE_URL);
   gasUrl.searchParams.set('action', 'getTodoItems');
@@ -1433,6 +1887,38 @@ function requestJson(targetUrl, options, redirectCount) {
   });
 }
 
+function requestBuffer(targetUrl, options, redirectCount) {
+  return new Promise((resolve, reject) => {
+    const currentRedirectCount = Number(redirectCount || 0);
+    const url = typeof targetUrl === 'string' ? new URL(targetUrl) : targetUrl;
+    const requestOptions = Object.assign({}, options || {});
+    const client = url.protocol === 'https:' ? https : http;
+
+    const request = client.request(url, requestOptions, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => {
+        const statusCode = response.statusCode || 500;
+        if ([301, 302, 303, 307, 308].includes(statusCode) && response.headers.location) {
+          if (currentRedirectCount >= 5) {
+            return reject(new Error(`HTTP ${statusCode}: too many redirects`));
+          }
+          const nextUrl = new URL(response.headers.location, url);
+          return resolve(requestBuffer(nextUrl, requestOptions, currentRedirectCount + 1));
+        }
+
+        const body = Buffer.concat(chunks);
+        if (statusCode >= 200 && statusCode < 300) return resolve(body);
+        return reject(new Error(`HTTP ${statusCode}: ${body.toString('utf8').slice(0, 180)}`));
+      });
+    });
+
+    request.on('error', reject);
+    if (requestOptions.body) request.write(requestOptions.body);
+    request.end();
+  });
+}
+
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload));
@@ -1441,6 +1927,11 @@ function sendJson(res, statusCode, payload) {
 function sendText(res, statusCode, text) {
   res.writeHead(statusCode, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end(text);
+}
+
+function sendHtml(res, statusCode, html) {
+  res.writeHead(statusCode, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
 }
 
 function loadEnvFile() {
