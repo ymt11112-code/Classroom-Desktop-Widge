@@ -1607,11 +1607,22 @@ async function addTodoItemToGas(task, dueDate) {
 }
 
 async function saveTodoReviewRecordToGas(review) {
-  const gasUrl = new URL(GAS_BASE_URL);
-  gasUrl.searchParams.set('action', 'saveTodoReviewRecord');
-  gasUrl.searchParams.set('data', JSON.stringify(review));
-  const response = await requestJson(gasUrl, { method: 'GET' });
-  if (!response.ok) throw new Error(response.error || '儲存待辦審核紀錄失敗');
+  const payload = JSON.stringify(review);
+  const chunkSize = 5000;
+  const totalChunks = Math.max(1, Math.ceil(payload.length / chunkSize));
+  let response = { ok: true };
+
+  for (let i = 0; i < totalChunks; i++) {
+    const gasUrl = new URL(GAS_BASE_URL);
+    gasUrl.searchParams.set('action', 'saveTodoReviewRecordChunk');
+    gasUrl.searchParams.set('reviewId', review.id);
+    gasUrl.searchParams.set('chunkIndex', String(i));
+    gasUrl.searchParams.set('totalChunks', String(totalChunks));
+    gasUrl.searchParams.set('chunk', payload.slice(i * chunkSize, (i + 1) * chunkSize));
+    response = await requestJson(gasUrl, { method: 'GET' });
+    if (!response.ok) throw new Error(response.error || '儲存待辦審核紀錄失敗');
+  }
+
   return response;
 }
 
@@ -2007,7 +2018,7 @@ function requestJson(targetUrl, options, redirectCount) {
         }
 
         if (statusCode >= 200 && statusCode < 300) return resolve(parsed);
-        return reject(new Error(`HTTP ${statusCode}: ${parsed.error || raw}`));
+        return reject(new Error(`HTTP ${statusCode}: ${formatHttpErrorBody(parsed, raw)}`));
       });
     });
 
@@ -2015,6 +2026,17 @@ function requestJson(targetUrl, options, redirectCount) {
     if (requestOptions.body) request.write(requestOptions.body);
     request.end();
   });
+}
+
+function formatHttpErrorBody(parsed, raw) {
+  if (parsed && parsed.error) {
+    if (typeof parsed.error === 'string') return parsed.error;
+    if (parsed.error.message) return parsed.error.message;
+    try {
+      return JSON.stringify(parsed.error).slice(0, 500);
+    } catch (_error) {}
+  }
+  return String(raw || '').replace(/\s+/g, ' ').replace(/<[^>]+>/g, ' ').trim().slice(0, 500);
 }
 
 function requestBuffer(targetUrl, options, redirectCount) {
