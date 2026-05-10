@@ -23,11 +23,13 @@ const LEAVE_TYPES = ['事假', '病假', '公假', '喪假', '曠課'];
 const PENDING_DRAFT_TTL_MS = 30 * 60 * 1000;
 const STUDENT_CACHE_TTL_MS = 5 * 60 * 1000;
 const TODO_REVIEW_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const TODO_BATCH_DEBOUNCE_MS = Number(process.env.TODO_BATCH_DEBOUNCE_MS || 20000);
 const MAX_INLINE_PDF_BYTES = 18 * 1024 * 1024;
 
 const pendingAbsenceDrafts = new Map();
 const pendingCounselingDrafts = new Map();
 const pendingTodoReviews = new Map();
+const pendingTodoSourceBatches = new Map();
 const studentCache = { expiresAt: 0, students: [] };
 
 if (!LINE_CHANNEL_SECRET) console.warn('Missing LINE_CHANNEL_SECRET');
@@ -104,7 +106,7 @@ async function processWebhookPayload(payload) {
 
     try {
       if (event.message.type === 'file') {
-        await prepareTodoReviewFromLineFile(replyToken, userId, event.message);
+        await queueTodoReviewFile(replyToken, userId, event.message);
         continue;
       }
 
@@ -140,7 +142,7 @@ async function processWebhookPayload(payload) {
 
       const todoAiText = parseTodoCandidateTextCommand(text);
       if (todoAiText) {
-        await prepareTodoReviewFromText(replyToken, userId, todoAiText);
+        await queueTodoReviewText(replyToken, userId, todoAiText);
         continue;
       }
 
@@ -1093,19 +1095,17 @@ function looksLikeLineReportTodoOpening(text) {
   return new RegExp(`^${rocDate}${weekday}.{0,40}${reportUnitOrMarker}`).test(compact);
 }
 
-async function prepareTodoReviewFromText(replyToken, userId, text) {
+async function queueTodoReviewText(replyToken, userId, text) {
   if (!userId) throw new Error('缺少 LINE userId，無法建立審核頁');
-  await respondToLineEvent(replyToken, userId, { type: 'text', text: '收到，我正在整理待辦候選清單...' });
-  const review = await createTodoReview({
+  await acknowledgeTodoBatch(replyToken, userId);
+  queueTodoReviewSource(userId, {
     sourceType: 'LINE',
     sourceLabel: 'LINE 訊息',
-    sourceText: text,
-    lineUserId: userId
+    sourceText: text
   });
-  await pushLineMessage(userId, buildTodoReviewLinkFlexMessage(review));
 }
 
-async function prepareTodoReviewFromLineFile(replyToken, userId, message) {
+async function queueTodoReviewFile(replyToken, userId, message) {
   const fileName = String((message && message.fileName) || '').trim();
   const messageId = String((message && message.id) || '').trim();
   if (!messageId) throw new Error('LINE 檔案缺少 message id');
@@ -1115,20 +1115,78 @@ async function prepareTodoReviewFromLineFile(replyToken, userId, message) {
   }
   if (!userId) throw new Error('缺少 LINE userId，無法建立審核頁');
 
-  await respondToLineEvent(replyToken, userId, { type: 'text', text: '收到 PDF，我正在請 Gemini 整理待辦候選清單...' });
+  await acknowledgeTodoBatch(replyToken, userId);
   const pdfBuffer = await downloadLineMessageContent(messageId);
   if (pdfBuffer.length > MAX_INLINE_PDF_BYTES) {
     throw new Error('PDF 超過 18MB，請先壓縮或拆成較小檔案再傳。');
   }
-
-  const review = await createTodoReview({
+  queueTodoReviewSource(userId, {
     sourceType: 'PDF',
     sourceLabel: fileName || 'LINE PDF',
     sourceText: fileName ? `檔名：${fileName}` : 'LINE PDF',
-    pdfBuffer,
+    pdfBuffer
+  });
+}
+
+async function acknowledgeTodoBatch(replyToken, userId) {
+  const batch = pendingTodoSourceBatches.get(userId);
+  if (batch && batch.notified) return;
+  await respondToLineEvent(replyToken, userId, {
+    type: 'text',
+    text: `收到，會把接下來 ${Math.round(TODO_BATCH_DEBOUNCE_MS / 1000)} 秒內傳來的報告訊息與 PDF 合併成同一個審核頁。`
+  });
+}
+
+function queueTodoReviewSource(userId, source) {
+  var batch = pendingTodoSourceBatches.get(userId);
+  if (!batch) {
+    batch = { createdAt: Date.now(), lineUserId: userId, sources: [], notified: true, timer: null };
+    pendingTodoSourceBatches.set(userId, batch);
+  }
+  batch.sources.push(source);
+  if (batch.timer) clearTimeout(batch.timer);
+  batch.timer = setTimeout(function() {
+    finalizeTodoReviewBatch(userId).catch(function(error) {
+      console.error('[finalizeTodoReviewBatch]', error && error.stack ? error.stack : error);
+      pushLineMessage(userId, {
+        type: 'text',
+        text: `整理待辦候選清單失敗：${error.message || error}`
+      }).catch(function(deliveryError) {
+        console.error('[todo batch delivery fallback]', deliveryError && deliveryError.stack ? deliveryError.stack : deliveryError);
+      });
+    });
+  }, TODO_BATCH_DEBOUNCE_MS);
+}
+
+async function finalizeTodoReviewBatch(userId) {
+  const batch = pendingTodoSourceBatches.get(userId);
+  if (!batch || !batch.sources || !batch.sources.length) return;
+  pendingTodoSourceBatches.delete(userId);
+
+  const review = await createTodoReview({
+    sourceType: batch.sources.some((source) => source.sourceType === 'PDF') ? 'MIXED' : 'LINE',
+    sourceLabel: buildTodoBatchSourceLabel(batch.sources),
+    sourceText: buildTodoBatchSourceText(batch.sources),
+    pdfBuffers: batch.sources.map((source) => source.pdfBuffer).filter(Boolean),
     lineUserId: userId
   });
   await pushLineMessage(userId, buildTodoReviewLinkFlexMessage(review));
+}
+
+function buildTodoBatchSourceLabel(sources) {
+  const pdfCount = sources.filter((source) => source.sourceType === 'PDF').length;
+  const lineCount = sources.filter((source) => source.sourceType === 'LINE').length;
+  const parts = [];
+  if (lineCount) parts.push(`${lineCount} 則 LINE 訊息`);
+  if (pdfCount) parts.push(`${pdfCount} 份 PDF`);
+  return parts.join(' + ') || 'LINE 批次資料';
+}
+
+function buildTodoBatchSourceText(sources) {
+  return sources.map((source, index) => {
+    const header = `【來源 ${index + 1}｜${source.sourceType || 'LINE'}｜${source.sourceLabel || ''}】`;
+    return [header, String(source.sourceText || '').trim()].filter(Boolean).join('\n');
+  }).join('\n\n');
 }
 
 async function createTodoReview(input) {
@@ -1170,11 +1228,12 @@ async function callGeminiForTodoCandidates(input) {
   if (!GEMINI_API_KEY) throw new Error('請在 Render 環境變數設定 GEMINI_API_KEY');
 
   const parts = [];
-  if (input.pdfBuffer) {
+  const pdfBuffers = input.pdfBuffers || (input.pdfBuffer ? [input.pdfBuffer] : []);
+  for (const pdfBuffer of pdfBuffers) {
     parts.push({
       inline_data: {
         mime_type: 'application/pdf',
-        data: input.pdfBuffer.toString('base64')
+        data: pdfBuffer.toString('base64')
       }
     });
   }
@@ -1203,19 +1262,20 @@ async function callGeminiForTodoCandidates(input) {
 }
 
 function buildTodoGeminiPrompt(input) {
-  const sourceType = input.sourceType === 'PDF' ? 'PDF' : 'LINE';
+  const sourceType = input.sourceType || 'LINE';
   const sourceText = String(input.sourceText || '').trim();
   return [
     '你是台灣國小導師的行政待辦整理助手。請從來源內容整理出需要老師後續處理的待辦候選清單。',
     '',
     '請嚴格回傳 JSON，格式如下：',
-    '{"items":[{"title":"事件及日期時間清楚的標題","subtitle":"補充說明，可包含表單或連結摘要","dueDate":"YYYY-MM-DD 或空字串","details":"來源詳情完整整理","sourceType":"PDF 或 LINE","sourceText":"原始來源文字；若來源為 LINE，一定要放完整訊息","teacherMessage":"給導師看的說明","parentMessage":"若需要轉傳家長群組，提供可直接轉傳文字，否則空字串","links":[{"label":"表單或連結名稱","url":"https://..."}]}]}',
+    '{"items":[{"title":"事件及日期時間清楚的標題","subtitle":"補充說明，可包含表單或連結摘要","dueDate":"YYYY-MM-DD 或空字串","details":"來源詳情完整整理","sourceType":"PDF、LINE 或 MIXED","sourceText":"原始來源文字；若來源含 LINE，一定要放完整訊息","teacherMessage":"給導師看的說明","parentMessage":"若需要轉傳家長群組，提供可直接轉傳文字，否則空字串","links":[{"label":"表單或連結名稱","url":"https://..."}]}]}',
     '',
     '規則：',
     '1. 標題要明確，列出清楚的事件及日期時間。',
     '2. subtitle 放標題下方小字，列出補充說明；若有表單或連結，links 必須抽出可點選 URL。',
     '3. details 要完整列出與標題相關的來源詳情，並標示來源是 PDF 還是 LINE。',
     '4. 若來源為 LINE，sourceText 必須是完整 LINE 訊息，不可摘要。',
+    '4a. 若同一批包含多則 LINE 訊息與 PDF，請交叉整合重複事項，輸出一份去重後的候選清單，不要依來源機械分開。',
     '5. 若內容需要傳達到家長群組，parentMessage 要寫可直接轉傳到家長群組的版本；teacherMessage 寫給導師自己看的版本。',
     '6. 只保留需要行動或追蹤的事項；不要加入寒暄或不存在的資訊。',
     '7. LINE 訊息開頭常是民國日期、處室/組別與報告編號，例如「1150506學務處轉知」或「115.5.6(三)國際組(#713)晨會報告」，請優先把這些資訊整理進標題或 subtitle。',
@@ -1547,14 +1607,10 @@ async function addTodoItemToGas(task, dueDate) {
 }
 
 async function saveTodoReviewRecordToGas(review) {
-  const body = new URLSearchParams();
-  body.set('action', 'saveTodoReviewRecord');
-  body.set('data', JSON.stringify(review));
-  const response = await requestJson(GAS_BASE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
-    body: body.toString()
-  });
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'saveTodoReviewRecord');
+  gasUrl.searchParams.set('data', JSON.stringify(review));
+  const response = await requestJson(gasUrl, { method: 'GET' });
   if (!response.ok) throw new Error(response.error || '儲存待辦審核紀錄失敗');
   return response;
 }
@@ -1569,15 +1625,11 @@ async function fetchTodoReviewRecordFromGas(reviewId) {
 }
 
 async function markTodoReviewCommittedInGas(reviewId, selectedIds) {
-  const body = new URLSearchParams();
-  body.set('action', 'markTodoReviewCommitted');
-  body.set('reviewId', reviewId);
-  body.set('selectedIds', JSON.stringify(selectedIds || []));
-  const response = await requestJson(GAS_BASE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
-    body: body.toString()
-  });
+  const gasUrl = new URL(GAS_BASE_URL);
+  gasUrl.searchParams.set('action', 'markTodoReviewCommitted');
+  gasUrl.searchParams.set('reviewId', reviewId);
+  gasUrl.searchParams.set('selectedIds', JSON.stringify(selectedIds || []));
+  const response = await requestJson(gasUrl, { method: 'GET' });
   if (!response.ok) throw new Error(response.error || '更新待辦審核紀錄失敗');
   return response;
 }
@@ -1853,7 +1905,15 @@ function getRowColor(period) {
 }
 
 async function respondToLineEvent(replyToken, userId, message) {
-  if (replyToken) return replyLineMessage(replyToken, message);
+  if (replyToken) {
+    try {
+      return await replyLineMessage(replyToken, message);
+    } catch (error) {
+      if (!userId) throw error;
+      console.warn('[reply fallback to push]', error && error.message ? error.message : error);
+      return pushLineMessage(userId, message);
+    }
+  }
   if (userId) return pushLineMessage(userId, message);
   throw new Error('No replyToken or userId available for delivery');
 }
