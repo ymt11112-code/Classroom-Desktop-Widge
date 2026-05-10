@@ -30,6 +30,7 @@ const pendingAbsenceDrafts = new Map();
 const pendingCounselingDrafts = new Map();
 const pendingTodoReviews = new Map();
 const pendingTodoSourceBatches = new Map();
+const recentTodoWindowTexts = new Map();
 const studentCache = { expiresAt: 0, students: [] };
 
 if (!LINE_CHANNEL_SECRET) console.warn('Missing LINE_CHANNEL_SECRET');
@@ -184,6 +185,11 @@ async function processWebhookPayload(payload) {
         continue;
       }
 
+      rememberRecentTodoWindowText(userId, text);
+      if (looksLikeTodoWindowCandidateText(text)) {
+        continue;
+      }
+
       const dateStr = parseQueryDate(text);
       if (dateStr) {
         const digest = await fetchLineDigest(dateStr);
@@ -217,12 +223,24 @@ function cleanupExpiredDrafts() {
   cleanupExpiredDraftMap(pendingAbsenceDrafts, now, PENDING_DRAFT_TTL_MS);
   cleanupExpiredDraftMap(pendingCounselingDrafts, now, PENDING_DRAFT_TTL_MS);
   cleanupExpiredDraftMap(pendingTodoReviews, now, TODO_REVIEW_TTL_MS);
+  cleanupRecentTodoWindowTexts(now);
 }
 
 function cleanupExpiredDraftMap(map, now, ttlMs) {
   for (const [userId, draft] of map.entries()) {
     if (!draft || !draft.createdAt || now - draft.createdAt > ttlMs) {
       map.delete(userId);
+    }
+  }
+}
+
+function cleanupRecentTodoWindowTexts(now) {
+  for (const [userId, items] of recentTodoWindowTexts.entries()) {
+    const recent = (items || []).filter((item) => item && now - item.createdAt <= TODO_BATCH_DEBOUNCE_MS);
+    if (recent.length) {
+      recentTodoWindowTexts.set(userId, recent);
+    } else {
+      recentTodoWindowTexts.delete(userId);
     }
   }
 }
@@ -1100,6 +1118,36 @@ function hasPendingTodoReviewBatch(userId) {
   return !!(batch && Array.isArray(batch.sources) && batch.sources.length);
 }
 
+function rememberRecentTodoWindowText(userId, text) {
+  if (!userId) return;
+  const value = String(text || '').trim();
+  if (!value) return;
+  const now = Date.now();
+  const existing = recentTodoWindowTexts.get(userId) || [];
+  existing.push({ createdAt: now, sourceType: 'LINE', sourceLabel: 'LINE 訊息', sourceText: value });
+  recentTodoWindowTexts.set(userId, existing.filter((item) => item && now - item.createdAt <= TODO_BATCH_DEBOUNCE_MS));
+}
+
+function takeRecentTodoWindowTexts(userId) {
+  if (!userId) return [];
+  const now = Date.now();
+  const existing = recentTodoWindowTexts.get(userId) || [];
+  const recent = existing.filter((item) => item && now - item.createdAt <= TODO_BATCH_DEBOUNCE_MS);
+  recentTodoWindowTexts.delete(userId);
+  return recent.map((item) => ({
+    sourceType: item.sourceType,
+    sourceLabel: item.sourceLabel,
+    sourceText: item.sourceText
+  }));
+}
+
+function looksLikeTodoWindowCandidateText(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (!/https?:\/\//i.test(value)) return false;
+  return /活動|比賽|競賽|報名|徵件|徵選|作品|檢附|參閱|辦法|截止|期限|轉知|公告|晨會|報告/.test(value);
+}
+
 function looksLikeLineReportTodoOpening(text) {
   const firstLine = String(text || '').trim().split(/\r?\n/)[0].trim();
   if (!firstLine) return false;
@@ -1138,6 +1186,7 @@ async function queueTodoReviewFile(replyToken, userId, message) {
   if (pdfBuffer.length > MAX_INLINE_PDF_BYTES) {
     throw new Error('PDF 超過 18MB，請先壓縮或拆成較小檔案再傳。');
   }
+  takeRecentTodoWindowTexts(userId).forEach((source) => queueTodoReviewSource(userId, source));
   queueTodoReviewSource(userId, {
     sourceType: 'PDF',
     sourceLabel: fileName || 'LINE PDF',
@@ -1582,6 +1631,16 @@ function buildTodoReviewHtml(review) {
     function linkify(text) {
       return esc(text).replace(/(https?:\\/\\/[^\\s<]+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
     }
+    function normalizeCompareText(text) {
+      return String(text || '').replace(/\\s+/g, '').trim();
+    }
+    function shouldShowSourceText(details, sourceText) {
+      const a = normalizeCompareText(details);
+      const b = normalizeCompareText(sourceText);
+      if (!b) return false;
+      if (!a) return true;
+      return a !== b && !a.includes(b) && !b.includes(a);
+    }
     function updateCount() {
       const n = document.querySelectorAll('input[type="checkbox"]:checked').length;
       count.textContent = '已勾選 ' + n + ' 項';
@@ -1591,6 +1650,8 @@ function buildTodoReviewHtml(review) {
         const checked = committed ? selectedSet.has(String(item.id)) : true;
         const links = (item.links || []).map(link => '<a href="' + esc(link.url) + '" target="_blank" rel="noopener">' + esc(link.label || '開啟連結') + '</a>').join('');
         const parentLink = item.parentMessage ? '<a class="line-btn" href="line://msg/text/' + encodeURIComponent(item.parentMessage) + '">傳送到 LINE</a>' : '';
+        const detailsText = item.details || '';
+        const sourceText = shouldShowSourceText(detailsText, item.sourceText) ? item.sourceText : '';
         return '<article class="card">'
           + '<div class="card-top"><input type="checkbox" data-id="' + esc(item.id) + '"' + (checked ? ' checked' : '') + (committed ? ' disabled' : '') + '><div>'
           + '<div class="title">' + esc(item.title) + '</div>'
@@ -1600,8 +1661,8 @@ function buildTodoReviewHtml(review) {
           + '</div></div>'
           + '<details><summary>展開來源詳情</summary><div class="detail">'
           + '<div class="source">來源：' + esc(item.sourceType || review.sourceType || '') + '</div>'
-          + (item.details ? '<div class="block">' + linkify(item.details) + '</div>' : '')
-          + (item.sourceText ? '<div class="block">' + linkify(item.sourceText) + '</div>' : '')
+          + (detailsText ? '<div class="block">' + linkify(detailsText) + '</div>' : '')
+          + (sourceText ? '<div class="block">' + linkify(sourceText) + '</div>' : '')
           + (item.teacherMessage ? '<div class="block"><strong>給導師看</strong>\\n' + linkify(item.teacherMessage) + '</div>' : '')
           + (item.parentMessage ? '<div class="block"><strong>轉傳家長群組</strong>\\n' + linkify(item.parentMessage) + '</div>' : '')
           + '</div></details></article>';
