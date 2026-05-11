@@ -15,6 +15,7 @@ const GAS_BASE_URL = String(process.env.GAS_BASE_URL || '').trim();
 const APP_TIMEZONE = String(process.env.APP_TIMEZONE || 'Asia/Taipei').trim();
 const GEMINI_API_KEY = String(process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = String(process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+const GEMINI_FALLBACK_MODELS = String(process.env.GEMINI_FALLBACK_MODELS || 'gemini-2.5-flash-lite,gemini-2.0-flash').trim();
 const REVIEW_BASE_URL = String(process.env.REVIEW_BASE_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
 
 const LINE_HOMEROOM = ['國語', '數學', '社會', '健康', '樂活'];
@@ -868,11 +869,33 @@ function inferDurationDays(text) {
   return null;
 }
 
+function inferSeatNumbersFromText(text) {
+  const value = String(text || '');
+  const matches = [];
+
+  for (const match of value.matchAll(/(^|[^\d])(\d{1,2})\s*(?:號|号|座號|座号)(?!\d)/g)) {
+    matches.push(match[2]);
+  }
+
+  const leadingMatch = value.match(/^\s*(\d{1,2})\s*(?=(?:號|号|座號|座号|[\u4e00-\u9fffA-Za-z]))/);
+  if (leadingMatch) matches.push(leadingMatch[1]);
+
+  return Array.from(new Set(matches
+    .map((seatNo) => parseInt(seatNo, 10))
+    .filter((seatNo) => !Number.isNaN(seatNo) && seatNo > 0)
+    .map((seatNo) => String(seatNo))));
+}
+
 function inferStudentsFromText(text, students) {
   if (String(text).includes('全班')) return ['全班'];
 
   const matches = [];
   const textWithoutDates = stripDatePhrases(text);
+
+  for (const seatNo of inferSeatNumbersFromText(textWithoutDates)) {
+    const student = findStudentBySeatNumber(seatNo, students);
+    if (student) matches.push(buildStudentLabel(student));
+  }
 
   for (const match of textWithoutDates.matchAll(/(^|[^\d])(\d{1,2})\s*號(?!\d)/g)) {
     const student = findStudentBySeatNumber(match[2], students);
@@ -1351,26 +1374,71 @@ async function callGeminiForTodoCandidates(input) {
   }
   parts.push({ text: buildTodoGeminiPrompt(input) });
 
-  const geminiUrl = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`);
-  geminiUrl.searchParams.set('key', GEMINI_API_KEY);
-
-  const response = await requestJson(geminiUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts }],
-      generationConfig: {
-        temperature: 0.2,
-        response_mime_type: 'application/json'
-      }
-    })
-  });
+  const response = await requestGeminiGenerateContent(parts);
 
   if (response.error) throw new Error(response.error.message || 'Gemini returned an error');
   const text = extractGeminiText(response);
   const parsed = parseGeminiJson(text);
   const rawItems = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.items) ? parsed.items : []);
   return normalizeTodoCandidates(rawItems, input);
+}
+
+async function requestGeminiGenerateContent(parts) {
+  const body = JSON.stringify({
+    contents: [{ role: 'user', parts }],
+    generationConfig: {
+      temperature: 0.2,
+      response_mime_type: 'application/json'
+    }
+  });
+  const models = buildGeminiModelList();
+  let lastError = null;
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const geminiUrl = new URL(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`);
+        geminiUrl.searchParams.set('key', GEMINI_API_KEY);
+        return await requestJson(geminiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body
+        });
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableGeminiError(error)) throw error;
+        const nextModelAvailable = models.indexOf(model) < models.length - 1;
+        console.warn(`[Gemini retry] model=${model} attempt=${attempt + 1}: ${error.message || error}`);
+        if (attempt === 0) {
+          await sleep(1600);
+        } else if (nextModelAvailable) {
+          break;
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error('Gemini request failed');
+}
+
+function buildGeminiModelList() {
+  const seen = {};
+  return [GEMINI_MODEL].concat(GEMINI_FALLBACK_MODELS.split(','))
+    .map((model) => String(model || '').trim())
+    .filter((model) => {
+      if (!model || seen[model]) return false;
+      seen[model] = true;
+      return true;
+    });
+}
+
+function isRetryableGeminiError(error) {
+  const message = String(error && error.message || error || '');
+  return /HTTP\s+(429|500|502|503|504)\b/.test(message) || /high demand|try again later|temporarily/i.test(message);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildTodoGeminiPrompt(input) {
