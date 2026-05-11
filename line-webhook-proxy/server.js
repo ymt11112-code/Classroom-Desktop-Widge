@@ -1429,8 +1429,18 @@ function normalizeTodoParentMessage(item, input) {
   const inputSource = String(input && input.sourceText || '').trim();
   const inputType = String(input && input.sourceType || '').trim().toUpperCase();
 
-  if (itemSource && looksLikeParentGroupMessage(itemSource)) return itemSource;
   if (explicit) return explicit;
+  if (!itemSource && inputType === 'LINE' && inputSource && looksLikeParentGroupMessage(inputSource)) return inputSource;
+  if (itemSource && looksLikeParentGroupMessage(itemSource)) return itemSource;
+  return '';
+}
+
+function normalizeTodoOriginalParentMessage(item, input) {
+  const itemSource = String(item && item.sourceText || '').trim();
+  const inputSource = String(input && input.sourceText || '').trim();
+  const inputType = String(input && input.sourceType || '').trim().toUpperCase();
+
+  if (itemSource && looksLikeParentGroupMessage(itemSource)) return itemSource;
   if (!itemSource && inputType === 'LINE' && inputSource && looksLikeParentGroupMessage(inputSource)) return inputSource;
   return '';
 }
@@ -1450,6 +1460,7 @@ function normalizeTodoCandidates(items, input) {
       sourceText: String(item.sourceText || input.sourceText || '').trim(),
       teacherMessage: String(item.teacherMessage || '').trim(),
       parentMessage: normalizeTodoParentMessage(item, input),
+      originalParentMessage: normalizeTodoOriginalParentMessage(item, input),
       links: links.map((link) => ({
         label: String(link && (link.label || link.url) || '').trim(),
         url: String(link && link.url || '').trim()
@@ -1623,6 +1634,9 @@ function buildTodoReviewHtml(review) {
     .source { color: #6d7f71; font-size: 12px; margin-bottom: 6px; font-weight: 700; }
     .parent-control { margin-top: 10px; display: inline-grid; grid-template-columns: 24px auto; gap: 8px; align-items: center; color: var(--green-dark); font-size: 14px; font-weight: 700; }
     .parent-control input { width: 20px; height: 20px; margin: 0; }
+    .forward-options { margin-top: 8px; display: grid; gap: 6px; padding: 8px 10px; border: 1px solid #dfeee0; border-radius: 8px; background: #f8fcf8; }
+    .forward-options label { display: grid; grid-template-columns: 18px 1fr; gap: 8px; align-items: center; color: #365b42; font-size: 13px; font-weight: 700; }
+    .forward-options input { width: 16px; height: 16px; margin: 0; accent-color: var(--green); }
     .bar { position: sticky; bottom: 0; display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 12px 14px; background: rgba(249, 252, 248, .96); border-top: 1px solid var(--line); backdrop-filter: blur(8px); }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     button { border: 0; border-radius: 8px; padding: 12px 14px; background: var(--green); color: white; font-weight: 800; font-size: 15px; }
@@ -1666,6 +1680,8 @@ function buildTodoReviewHtml(review) {
     document.getElementById('meta').textContent = (review.sourceType || '') + ' - ' + (review.sourceLabel || '') + ' - ' + review.candidates.length + ' 個候選項目';
     const committed = Boolean(review.committedAt);
     const selectedSet = new Set((review.selectedIds || []).map(String));
+    let forwardQueue = [];
+    let forwardIndex = 0;
 
     function esc(value) {
       return String(value || '').replace(/[&<>"']/g, ch => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[ch]));
@@ -1683,18 +1699,54 @@ function buildTodoReviewHtml(review) {
       if (!a) return true;
       return a !== b && !a.includes(b) && !b.includes(a);
     }
+    function isSameMessage(a, b) {
+      return normalizeCompareText(a) === normalizeCompareText(b);
+    }
+    function getOriginalForwardText(item) {
+      return String(item.originalParentMessage || '').trim();
+    }
+    function getGeminiForwardText(item) {
+      return String(item.parentMessage || '').trim();
+    }
+    function buildForwardOptions(item) {
+      const original = getOriginalForwardText(item);
+      const gemini = getGeminiForwardText(item);
+      if (!original || !gemini || isSameMessage(original, gemini)) return '';
+      const preferOriginal = String(item.sourceType || '').toUpperCase() === 'LINE';
+      return '<div class="forward-options">'
+        + '<label><input type="radio" name="forward-mode-' + esc(item.id) + '" value="original"' + (preferOriginal ? ' checked' : '') + '>使用原始資料</label>'
+        + '<label><input type="radio" name="forward-mode-' + esc(item.id) + '" value="gemini"' + (!preferOriginal ? ' checked' : '') + '>使用整理後訊息</label>'
+        + '</div>';
+    }
+    function getChosenForwardText(item) {
+      const original = getOriginalForwardText(item);
+      const gemini = getGeminiForwardText(item);
+      const modes = Array.from(document.getElementsByName('forward-mode-' + String(item.id)));
+      const mode = modes.find(input => input.checked);
+      if (mode && mode.value === 'original' && original) return original;
+      return gemini || original;
+    }
     function updateCount() {
       const todoCount = document.querySelectorAll('.todo-box:checked').length;
       const parentCount = document.querySelectorAll('.parent-forward-box:checked').length;
       count.textContent = '待辦 ' + todoCount + ' 項｜轉傳 ' + parentCount + ' 則';
     }
+    function resetForwardQueue() {
+      forwardQueue = [];
+      forwardIndex = 0;
+      if (!forward.disabled) forward.textContent = '一鍵轉傳訊息';
+    }
     function render() {
       list.innerHTML = review.candidates.map(item => {
         const checked = committed ? selectedSet.has(String(item.id)) : true;
         const links = (item.links || []).map(link => '<a href="' + esc(link.url) + '" target="_blank" rel="noopener">' + esc(link.label || '開啟連結') + '</a>').join('');
-        const parentControl = item.parentMessage ? '<label class="parent-control"><input type="checkbox" class="parent-forward-box" data-id="' + esc(item.id) + '" checked>選取轉傳家長群組訊息</label>' : '';
+        const hasForwardMessage = Boolean(getGeminiForwardText(item) || getOriginalForwardText(item));
+        const parentControl = hasForwardMessage ? '<label class="parent-control"><input type="checkbox" class="parent-forward-box" data-id="' + esc(item.id) + '" checked>選取轉傳家長群組訊息</label>' + buildForwardOptions(item) : '';
         const detailsText = item.details || '';
         const sourceText = shouldShowSourceText(detailsText, item.sourceText) ? item.sourceText : '';
+        const originalForwardText = getOriginalForwardText(item);
+        const geminiForwardText = getGeminiForwardText(item);
+        const showOriginalForward = originalForwardText && geminiForwardText && !isSameMessage(originalForwardText, geminiForwardText) && !isSameMessage(originalForwardText, sourceText);
         return '<article class="card">'
           + '<div class="card-top"><input type="checkbox" class="todo-box" data-id="' + esc(item.id) + '"' + (checked ? ' checked' : '') + (committed ? ' disabled' : '') + '><div>'
           + '<div class="title">' + esc(item.title) + '</div>'
@@ -1708,10 +1760,14 @@ function buildTodoReviewHtml(review) {
           + (detailsText ? '<div class="block">' + linkify(detailsText) + '</div>' : '')
           + (sourceText ? '<div class="block">' + linkify(sourceText) + '</div>' : '')
           + (item.teacherMessage ? '<div class="block"><strong>給導師看</strong>\\n' + linkify(item.teacherMessage) + '</div>' : '')
-          + (item.parentMessage ? '<div class="block"><strong>轉傳家長群組</strong>\\n' + linkify(item.parentMessage) + '</div>' : '')
+          + (showOriginalForward ? '<div class="block"><strong>原始轉傳資料</strong>\\n' + linkify(originalForwardText) + '</div>' : '')
+          + (geminiForwardText ? '<div class="block"><strong>整理後轉傳訊息</strong>\\n' + linkify(geminiForwardText) + '</div>' : '')
           + '</div></details></article>';
       }).join('');
-      document.querySelectorAll('input[type="checkbox"]').forEach(box => box.addEventListener('change', updateCount));
+      document.querySelectorAll('input[type="checkbox"], input[type="radio"]').forEach(box => box.addEventListener('change', () => {
+        resetForwardQueue();
+        updateCount();
+      }));
       if (committed) {
         submit.disabled = true;
         submit.textContent = '已加入待辦';
@@ -1746,15 +1802,23 @@ function buildTodoReviewHtml(review) {
     forward.addEventListener('click', () => {
       const selectedIds = new Set(Array.from(document.querySelectorAll('.parent-forward-box:checked')).map(box => box.dataset.id));
       const messages = review.candidates
-        .filter(item => selectedIds.has(String(item.id)) && item.parentMessage)
-        .map(item => String(item.parentMessage || '').trim())
+        .filter(item => selectedIds.has(String(item.id)) && (item.parentMessage || item.originalParentMessage))
+        .map(item => getChosenForwardText(item))
         .filter(Boolean);
       if (!messages.length) {
         toast.textContent = '請先勾選至少一則要轉傳的家長群組訊息。';
         return;
       }
-      const combined = messages.join('\\n\\n');
-      window.location.href = 'line://msg/text/' + encodeURIComponent(combined);
+      const changed = messages.length !== forwardQueue.length || messages.some((message, index) => message !== forwardQueue[index]);
+      if (changed || forwardIndex >= forwardQueue.length) {
+        forwardQueue = messages;
+        forwardIndex = 0;
+      }
+      const current = forwardQueue[forwardIndex];
+      forwardIndex += 1;
+      forward.textContent = forwardIndex < forwardQueue.length ? '轉傳下一則 ' + (forwardIndex + 1) + '/' + forwardQueue.length : '重新分次轉傳';
+      toast.textContent = '正在開啟第 ' + forwardIndex + ' / ' + forwardQueue.length + ' 則。送出後回到此頁，再按下一則。';
+      window.location.href = 'line://msg/text/' + encodeURIComponent(current);
     });
     render();
   </script>
