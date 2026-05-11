@@ -185,6 +185,11 @@ async function processWebhookPayload(payload) {
         continue;
       }
 
+      if (looksLikeParentGroupMessage(text) && !looksLikeAbsenceMessage(text)) {
+        await queueTodoReviewText(replyToken, userId, text);
+        continue;
+      }
+
       rememberRecentTodoWindowText(userId, text);
       if (looksLikeTodoWindowCandidateText(text)) {
         continue;
@@ -1106,6 +1111,20 @@ function parseTodoCandidateTextCommand(text) {
   return null;
 }
 
+function looksLikeParentGroupMessage(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+
+  const firstLines = value.split(/\r?\n/).slice(0, 8).join('\n');
+  const mentionsParentAudience = /家長|貴家長|各位家長|親愛的家長|爸爸媽媽|爸媽|父母|班親|親師|家長群組|家長群|班級群組|班群/.test(firstLines);
+  const asksParentAction = /請|敬請|麻煩|協助|提醒|留意|注意|填寫|回覆|繳交|報名|參加|完成|攜帶|帶著|轉知|轉傳|配合/.test(value);
+  if (mentionsParentAudience && asksParentAction) return true;
+
+  if (/轉傳.{0,12}家長|家長.{0,12}轉傳|傳給.{0,12}家長|家長群組/.test(value)) return true;
+
+  return false;
+}
+
 function looksLikeTodoBroadcastOpening(text) {
   const firstLine = String(text || '').trim().split(/\r?\n/)[0].trim();
   if (!firstLine) return false;
@@ -1370,6 +1389,8 @@ function buildTodoGeminiPrompt(input) {
     '4. 若來源為 LINE，sourceText 必須是完整 LINE 訊息，不可摘要。',
     '4a. 若同一批包含多則 LINE 訊息與 PDF，請交叉整合重複事項，輸出一份去重後的候選清單，不要依來源機械分開。',
     '5. 若內容需要傳達到家長群組，parentMessage 要寫可直接轉傳到家長群組的版本；teacherMessage 寫給導師自己看的版本。',
+    '5a. 若 LINE 原始訊息本身已經是給家長看的口吻，parentMessage 必須保留原文，不要濃縮、改寫或換語氣。',
+    '5b. 若只是校內行政提醒、教師內部作業或不適合家長群組的內容，parentMessage 請留空字串。',
     '6. 只保留需要行動或追蹤的事項；不要加入寒暄或不存在的資訊。',
     '7. LINE 訊息開頭常是民國日期、處室/組別與報告編號，例如「1150506學務處轉知」或「115.5.6(三)國際組(#713)晨會報告」，請優先把這些資訊整理進標題或 subtitle。',
     '8. 篩選優先順序：全校相關、四年級相關、四學年相關、需要導師班級宣導或提醒學生的內容。這些內容即使沒有明確表單或截止日期，也要列為候選。',
@@ -1402,6 +1423,18 @@ function parseGeminiJson(text) {
   }
 }
 
+function normalizeTodoParentMessage(item, input) {
+  const explicit = String(item && item.parentMessage || '').trim();
+  const itemSource = String(item && item.sourceText || '').trim();
+  const inputSource = String(input && input.sourceText || '').trim();
+  const inputType = String(input && input.sourceType || '').trim().toUpperCase();
+
+  if (itemSource && looksLikeParentGroupMessage(itemSource)) return itemSource;
+  if (explicit) return explicit;
+  if (!itemSource && inputType === 'LINE' && inputSource && looksLikeParentGroupMessage(inputSource)) return inputSource;
+  return '';
+}
+
 function normalizeTodoCandidates(items, input) {
   return (items || []).map((item, index) => {
     const title = String(item && item.title || '').trim();
@@ -1416,7 +1449,7 @@ function normalizeTodoCandidates(items, input) {
       sourceType: String(item.sourceType || input.sourceType || '').trim(),
       sourceText: String(item.sourceText || input.sourceText || '').trim(),
       teacherMessage: String(item.teacherMessage || '').trim(),
-      parentMessage: String(item.parentMessage || '').trim(),
+      parentMessage: normalizeTodoParentMessage(item, input),
       links: links.map((link) => ({
         label: String(link && (link.label || link.url) || '').trim(),
         url: String(link && link.url || '').trim()
@@ -1588,8 +1621,12 @@ function buildTodoReviewHtml(review) {
     .detail { padding: 0 12px 12px; color: #3d4b41; font-size: 14px; line-height: 1.6; }
     .block { margin-top: 10px; padding: 10px; background: #f6faf6; border: 1px solid #e2efe2; border-radius: 8px; white-space: pre-wrap; }
     .source { color: #6d7f71; font-size: 12px; margin-bottom: 6px; font-weight: 700; }
+    .parent-control { margin-top: 10px; display: inline-grid; grid-template-columns: 24px auto; gap: 8px; align-items: center; color: var(--green-dark); font-size: 14px; font-weight: 700; }
+    .parent-control input { width: 20px; height: 20px; margin: 0; }
     .bar { position: sticky; bottom: 0; display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 12px 14px; background: rgba(249, 252, 248, .96); border-top: 1px solid var(--line); backdrop-filter: blur(8px); }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
     button { border: 0; border-radius: 8px; padding: 12px 14px; background: var(--green); color: white; font-weight: 800; font-size: 15px; }
+    .secondary { background: #176c8f; }
     button:disabled { opacity: .55; }
     .count { align-self: center; color: #5c7464; font-size: 14px; }
     .toast { min-height: 22px; padding: 0 14px 12px; color: var(--green-dark); font-weight: 700; }
@@ -1598,6 +1635,7 @@ function buildTodoReviewHtml(review) {
       .card-top { grid-template-columns: 30px 1fr; padding: 11px; }
       .title { font-size: 16px; }
       .bar { grid-template-columns: 1fr; }
+      .actions { display: grid; grid-template-columns: 1fr 1fr; }
       button { width: 100%; }
     }
   </style>
@@ -1611,7 +1649,10 @@ function buildTodoReviewHtml(review) {
     <main id="list"></main>
     <div class="bar">
       <div class="count" id="count">已勾選 0 項</div>
-      <button id="submit">加入勾選項目</button>
+      <div class="actions">
+        <button id="submit">加入待辦清單</button>
+        <button id="forward" class="secondary">一鍵轉傳訊息</button>
+      </div>
     </div>
     <div class="toast" id="toast"></div>
   </div>
@@ -1620,6 +1661,7 @@ function buildTodoReviewHtml(review) {
     const list = document.getElementById('list');
     const count = document.getElementById('count');
     const submit = document.getElementById('submit');
+    const forward = document.getElementById('forward');
     const toast = document.getElementById('toast');
     document.getElementById('meta').textContent = (review.sourceType || '') + ' - ' + (review.sourceLabel || '') + ' - ' + review.candidates.length + ' 個候選項目';
     const committed = Boolean(review.committedAt);
@@ -1642,22 +1684,24 @@ function buildTodoReviewHtml(review) {
       return a !== b && !a.includes(b) && !b.includes(a);
     }
     function updateCount() {
-      const n = document.querySelectorAll('input[type="checkbox"]:checked').length;
-      count.textContent = '已勾選 ' + n + ' 項';
+      const todoCount = document.querySelectorAll('.todo-box:checked').length;
+      const parentCount = document.querySelectorAll('.parent-forward-box:checked').length;
+      count.textContent = '待辦 ' + todoCount + ' 項｜轉傳 ' + parentCount + ' 則';
     }
     function render() {
       list.innerHTML = review.candidates.map(item => {
         const checked = committed ? selectedSet.has(String(item.id)) : true;
         const links = (item.links || []).map(link => '<a href="' + esc(link.url) + '" target="_blank" rel="noopener">' + esc(link.label || '開啟連結') + '</a>').join('');
-        const parentLink = item.parentMessage ? '<a class="line-btn" href="line://msg/text/' + encodeURIComponent(item.parentMessage) + '">傳送到 LINE</a>' : '';
+        const parentControl = item.parentMessage ? '<label class="parent-control"><input type="checkbox" class="parent-forward-box" data-id="' + esc(item.id) + '" checked>選取轉傳家長群組訊息</label>' : '';
         const detailsText = item.details || '';
         const sourceText = shouldShowSourceText(detailsText, item.sourceText) ? item.sourceText : '';
         return '<article class="card">'
-          + '<div class="card-top"><input type="checkbox" data-id="' + esc(item.id) + '"' + (checked ? ' checked' : '') + (committed ? ' disabled' : '') + '><div>'
+          + '<div class="card-top"><input type="checkbox" class="todo-box" data-id="' + esc(item.id) + '"' + (checked ? ' checked' : '') + (committed ? ' disabled' : '') + '><div>'
           + '<div class="title">' + esc(item.title) + '</div>'
           + (item.subtitle ? '<div class="subtitle">' + linkify(item.subtitle) + '</div>' : '')
           + (item.dueDate ? '<span class="due">' + esc(item.dueDate) + '</span>' : '')
-          + ((links || parentLink) ? '<div class="links">' + links + parentLink + '</div>' : '')
+          + (links ? '<div class="links">' + links + '</div>' : '')
+          + parentControl
           + '</div></div>'
           + '<details><summary>展開來源詳情</summary><div class="detail">'
           + '<div class="source">來源：' + esc(item.sourceType || review.sourceType || '') + '</div>'
@@ -1673,11 +1717,14 @@ function buildTodoReviewHtml(review) {
         submit.textContent = '已加入待辦';
         toast.textContent = '這份審核清單已寫入過，頁面保留供回看。';
       }
+      if (!document.querySelectorAll('.parent-forward-box').length) {
+        forward.disabled = true;
+      }
       updateCount();
     }
     submit.addEventListener('click', async () => {
       if (committed) return;
-      const selectedIds = Array.from(document.querySelectorAll('input[type="checkbox"]:checked')).map(box => box.dataset.id);
+      const selectedIds = Array.from(document.querySelectorAll('.todo-box:checked')).map(box => box.dataset.id);
       if (!selectedIds.length) { toast.textContent = '請先勾選至少一個項目。'; return; }
       submit.disabled = true;
       toast.textContent = '正在寫入 Google Sheet...';
@@ -1695,6 +1742,19 @@ function buildTodoReviewHtml(review) {
         submit.disabled = false;
         toast.textContent = error.message || String(error);
       }
+    });
+    forward.addEventListener('click', () => {
+      const selectedIds = new Set(Array.from(document.querySelectorAll('.parent-forward-box:checked')).map(box => box.dataset.id));
+      const messages = review.candidates
+        .filter(item => selectedIds.has(String(item.id)) && item.parentMessage)
+        .map(item => String(item.parentMessage || '').trim())
+        .filter(Boolean);
+      if (!messages.length) {
+        toast.textContent = '請先勾選至少一則要轉傳的家長群組訊息。';
+        return;
+      }
+      const combined = messages.join('\\n\\n');
+      window.location.href = 'line://msg/text/' + encodeURIComponent(combined);
     });
     render();
   </script>
